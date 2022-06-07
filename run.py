@@ -7,7 +7,6 @@ from tqdm import tqdm
 import torch
 import transformers
 from transformers import AutoModel
-from sklearn.metrics import precision_recall_fscore_support
 from sklearn.model_selection import KFold
 
 from utils import *
@@ -107,7 +106,7 @@ def main():
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description = 'arguments for training and evaluating the document pooler')
-    parser.add_argument('--backbone', type = str, default = 'nli-bert-base', help = 'backbone for extracting sentence embedding from the original text, can be either nli-bert-base or stsb=bert-base')
+    parser.add_argument('--backbone', type = str, default = 'nli-bert-base', help = 'backbone for extracting sentence embedding from the original text, can be either nli-bert-base or stsb-bert-base')
     parser.add_argument('--pooling_ops', type = str, default = 'max', help = 'the pooling operation in the model')
     parser.add_argument('--batch_size', type = int, default = 32)
     parser.add_argument('--n_epoch', type = int, default = 200)
