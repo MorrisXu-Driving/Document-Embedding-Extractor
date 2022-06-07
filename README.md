@@ -8,7 +8,7 @@
 * tqdm
 * numpy
 * pandas
-* Pytorch 1.10 or above
+* Pytorch 1.10 or above **with GPU support**
 * transformers
 * sentence-transformers
 * pytorch_metric_learning
