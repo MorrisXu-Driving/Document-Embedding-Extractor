@@ -47,8 +47,6 @@ def get_embedding_bank(dataset, max_num_seq):
         input, target = prepare_20ng()
     elif dataset == 'reuters':
         input, target = prepare_reuters()
-    elif dataset == 'mr':
-        input, target = prepare_movie_review()
     else:
         raise NotImplementedError
 
