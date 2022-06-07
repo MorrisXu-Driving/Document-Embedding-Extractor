@@ -51,4 +51,5 @@ INFO:root:Overall::Recall@1:0.4891 Recall@2:0.5516 Recall@4:0.6103 Recall@8:0.67
 ```
 ## Visualization
 If the model converges smoothly, you can see the embeddings are well clustered according to their classes, the visualization will be generated during the evaluation.
+
 ![embedding_visualization](Embedding.png)
