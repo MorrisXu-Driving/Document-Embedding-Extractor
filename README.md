@@ -1,5 +1,5 @@
-# Document-Embedding-Extractor
-====
+# Document-Embedding-Extractor (Updating)
+
 # Prerequisites
 * Python 3.6 or above
 * sklearn
@@ -13,7 +13,7 @@
 * sentence-transformers
 * pytorch_metric_learning
 
-# project structure (Updating)
+# Project Structure
 ```
 ├── run.py            # the main program + extract document matrixs from original text
 ├── model.py          # model definition
@@ -31,3 +31,22 @@ python run.py
 ```shell
 python run.py --backbone nli-bert-base --pooling_ops max --batch_size 32 --margin 0.05 --is_debug False --device 0
 ```
+
+# Result
+## Logs
+After successful training, you can see logs like below:
+```
+INFO:root:Training on 20ng
+INFO:root:Eval on 20 News Group
+INFO:root:Ave number of sentences:11.2959
+INFO:sentence_transformers.SentenceTransformer:Load pretrained SentenceTransformer: nli-bert-base
+INFO:sentence_transformers.SentenceTransformer:Use pytorch device: cuda
+INFO:root:20ng map to embeddings with 256 dim
+INFO:root:Fold0::Recall@1:0.4701 Recall@2:0.5495 Recall@4:0.6079 Recall@8:0.6809 Recall@16:0.7418
+INFO:root:Fold1::Recall@1:0.4845 Recall@2:0.5409 Recall@4:0.6015 Recall@8:0.6792 Recall@16:0.7619
+INFO:root:Fold2::Recall@1:0.5011 Recall@2:0.5529 Recall@4:0.6061 Recall@8:0.6683 Recall@16:0.7439
+INFO:root:Fold3::Recall@1:0.5115 Recall@2:0.5717 Recall@4:0.6331 Recall@8:0.6967 Recall@16:0.7646
+INFO:root:Fold4::Recall@1:0.4785 Recall@2:0.5428 Recall@4:0.6028 Recall@8:0.6735 Recall@16:0.7471
+INFO:root:Overall::Recall@1:0.4891 Recall@2:0.5516 Recall@4:0.6103 Recall@8:0.6797 Recall@16:0.7518
+```
+## Visualization
