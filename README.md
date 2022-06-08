@@ -53,3 +53,7 @@ INFO:root:Overall::Recall@1:0.4891 Recall@2:0.5516 Recall@4:0.6103 Recall@8:0.67
 If the model converges smoothly, you can see the embeddings are well clustered according to their classes. The visualization will be generated during the evaluation.
 
 ![embedding_visualization](Embedding.png)
+
+# Reference
+- [Convolutional Neural Networks for Sentence Classification](https://arxiv.org/pdf/1408.5882.pdf)
+- [Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks](https://arxiv.org/abs/1908.10084)
