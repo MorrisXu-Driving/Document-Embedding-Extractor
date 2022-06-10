@@ -126,7 +126,7 @@ if __name__ == '__main__':
     is_debug = args.is_debug
     
     
-    output_path = './logs/cnn/clustering/{}'.format(backbone)
+    output_path = f'./logs/cnn/clustering/{backbone}'
     if not os.path.exists(output_path):
         os.makedirs(output_path)
     logging.basicConfig(filename = output_path + '/train.log', level = logging.INFO)
