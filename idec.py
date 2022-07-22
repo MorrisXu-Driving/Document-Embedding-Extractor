@@ -22,6 +22,24 @@ movie_review_path = '/raid1/p3/jiahao/Datasets/cornell_movie_review'
 fake_news_path = "/raid1/p3/jiahao/Datasets/fake_news_detection"
 corona_tweets_path="/raid1/p3/jiahao/Datasets/corona_tweets/Corona_NLP"
 
+class IDEC(nn.Module):
+    def __init__(self, d_model, n_emb, n_cluster, alpha = 1, pretrain_path = f'{output_path}/ae_{}.pkl'):
+        super(IDEC, self).__init__()
+        self.alpha = alpha
+        self.pretrain_path = pretrain_path
+        self.ae = CNNPoolingAE(d_model, n_emb)
+        self.cluster_layer = Parameter(torch.Tensor(n_clusters, n_emb))
+        torch.nn.init.xavier_uniform_(self.cluster_layer.data)
+    
+    def forward(self, x):
+        x_prime, z = self.ae(x)
+        q = 1.0 / (1.0 + torch.sum(
+            torch.pow(z.unsqueeze(1) - self.cluster_layer, 2), 2) / self.alpha)
+        q = q.pow((self.alpha + 1.0) / 2.0)
+        q = (q.t() / torch.sum(q, 1)).t()
+        return x_bar, q
+
+        
 class CNNPoolingAE(nn.Module):
     def __init__(self, d_model, n_emb):
         super(CNNPoolingAE, self).__init__()
@@ -36,6 +54,9 @@ class CNNPoolingAE(nn.Module):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+    def pretrain(self, path = ''):
+        if path == '':
+            pretrain_ae(self.ae)
 
     def forward(self, x, n_sents=None):
         z, f1, f2, f3 = self.encoder(x)
@@ -622,8 +643,37 @@ def train_classifier(n_class, train_embedding, train_n_sents, train_target,
 
 
 '''IDEC'''
+def target_distribution(q):
+    weight = q**2 / q.sum(0)
+    return (weight.t() / weight.sum(1)).t()
 
+def pretrain(args, ae, embedding, patience, pretrain_path=''):
+    if path == '':
+        pretrain_ae(args, ae, embedding, patience)
+    else:
+        self.ae.load_state_dict(torch.load(pretrain_path))
+        print(f'load pretrained ae from {pretrain_path}')
 
+        
+def pretrain_ae(args, ae, train_embeddings, path='', patience = 5):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    optimizer = optim.SGD(ae.parameters(), lr = args.lr)
+    for epoch in tqdm(range(args.n_epoch), desc='train'):
+        total_loss = 0.
+        for i in range(0, len(train_embedding), args.batch_size):
+            x = torch.tensor(train_embedding[i:i + batch_size], dtype=torch.float, device=device)
+            optimizer.zero_grad()
+            x_prime, _ = ae(x)
+            loss = F.mse_loss(x_prime, x)
+            total_loss += loss.item()
+            
+            loss.backward()
+            optimizer.step()
+            
+        print("epoch {} loss = {:.4f}".format(epoch, total_loss / i))
+        torch.save(ae.state_dict(), pretrain_path)
+        
+    print(f"model saved to {pretrain_path}.")
 
 def dataset_training(dataset, args):
     logging.info('Training on {}'.format(dataset))
