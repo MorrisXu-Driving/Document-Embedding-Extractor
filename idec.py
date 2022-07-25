@@ -7,13 +7,16 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import transformers
+from RetMetric import RetMetric
 from nltk.tokenize import sent_tokenize
 from sklearn.datasets import fetch_20newsgroups
 from sklearn.metrics import precision_recall_fscore_support
 from tqdm import tqdm
 from sklearn.model_selection import KFold
 from transformers import AutoModel, AutoTokenizer
+import ipdb
 import sys
 import os
 sys.path.append('..')
@@ -23,21 +26,20 @@ fake_news_path = "/raid1/p3/jiahao/Datasets/fake_news_detection"
 corona_tweets_path="/raid1/p3/jiahao/Datasets/corona_tweets/Corona_NLP"
 
 class IDEC(nn.Module):
-    def __init__(self, d_model, n_emb, n_cluster, alpha = 1, pretrain_path = f'{output_path}/ae_{}.pkl'):
+    def __init__(self, d_model, n_emb, n_cluster, alpha = 1):
         super(IDEC, self).__init__()
         self.alpha = alpha
-        self.pretrain_path = pretrain_path
         self.ae = CNNPoolingAE(d_model, n_emb)
-        self.cluster_layer = Parameter(torch.Tensor(n_clusters, n_emb))
+        self.cluster_layer = nn.Parameter(torch.Tensor(n_cluster, n_emb))
         torch.nn.init.xavier_uniform_(self.cluster_layer.data)
     
-    def forward(self, x):
+    def forward(self, x, n_sents=None):
         x_prime, z = self.ae(x)
         q = 1.0 / (1.0 + torch.sum(
             torch.pow(z.unsqueeze(1) - self.cluster_layer, 2), 2) / self.alpha)
         q = q.pow((self.alpha + 1.0) / 2.0)
         q = (q.t() / torch.sum(q, 1)).t()
-        return x_bar, q
+        return x_prime, q
 
         
 class CNNPoolingAE(nn.Module):
@@ -47,9 +49,9 @@ class CNNPoolingAE(nn.Module):
         
         self.encoder = CNNPoolingClassifier(d_model, n_emb)
         
-        self.tcnn1 = nn.Sequential([nn.ConvTranspose2d(c, 1, (2, d_model), padding=[1,0]), nn.ReLU(inplace=True)])
-        self.tcnn2 = nn.Sequential([nn.ConvTranspose2d(c, 1, (3, d_model), padding=[1,0]), nn.ReLU(inplace=True)])
-        self.tcnn3 = nn.Sequential([nn.ConvTranspose2d(c, 1, (4, d_model), padding=[1,0]), nn.ReLU(inplace=True)])
+        self.tcnn1 = nn.Sequential(nn.ConvTranspose2d(c, 1, (2, d_model), padding=[1,0]), nn.ReLU(inplace=True))
+        self.tcnn2 = nn.Sequential(nn.ConvTranspose2d(c, 1, (3, d_model), padding=[1,0]), nn.ReLU(inplace=True))
+        self.tcnn3 = nn.Sequential(nn.ConvTranspose2d(c, 1, (4, d_model), padding=[1,0]), nn.ReLU(inplace=True))
 
         for p in self.parameters():
             if p.dim() > 1:
@@ -96,9 +98,9 @@ class CNNPoolingClassifier(nn.Module):
         f2 = self.cnn2(x)  # [b, c, n, 1]
         f3 = self.cnn3(x)  # [b, c, n, 1]
 
-        doc_embedding = torch.relu(torch.cat([self.pooling(f1).squeeze(-1), self.pooling(f2).squeeze(-1), self.pooling(f3).squeeze(-1)], dim=1))  # [b, d_model]
+        doc_embedding = torch.relu(torch.cat([self.pooling(f1.squeeze(-1)), self.pooling(f2.squeeze(-1)), self.pooling(f3.squeeze(-1))], dim=1))  # [b, d_model]
         output = self.cls(doc_embedding)
-        return z, f1, f2, f3
+        return output, f1, f2, f3
 
     
 import datasets
@@ -121,7 +123,6 @@ def prepare_fake_news_detection(args):
     df = pd.DataFrame({'data': combined["sents"], 'target':combined["label"] })
     if args.is_debug:
         df =  df[:100]
-
 
     # filter out the empty list
     df = df[df["data"].apply(lambda x: len(x)>0)]
@@ -177,8 +178,6 @@ def prepare_corona_tweets(args):
         df = df[:100]
 
     return df["data"].tolist(), df["target"].to_numpy()
-
-
 
 
 def prepare_20ng(args):
@@ -367,7 +366,6 @@ def get_sent_embedding(docs, args):
     return embedding_bank
 
 
-
 def get_embedding_bank(dataset, args):
     if dataset == '20ng':
         input, target = prepare_20ng(args)
@@ -407,8 +405,8 @@ def aggregator(x, n_sents, strategy="minmax"):
     else:
         raise NotImplementedError
 
-from sklearn import cluster
 
+from sklearn import cluster
 from scipy.optimize import linear_sum_assignment as hungarian
 from sklearn.metrics.cluster import normalized_mutual_info_score, adjusted_rand_score, adjusted_mutual_info_score
 class Confusion(object):
@@ -537,13 +535,13 @@ class Confusion(object):
 def clustering_single_trial(y_true, embeddings=None, num_classes=10, random_state=0):
     """"Evaluate the embeddings using KMeans"""
     kmeans = cluster.KMeans(n_clusters=num_classes, random_state=random_state)
-    kmeans.fit(embeddings)
+    kmeans.fit(embeddings.cpu().detach().numpy())
     y_pred = kmeans.labels_.astype(np.int)
 
     confusion = Confusion(num_classes)
     confusion.add(torch.tensor(y_pred), torch.tensor(y_true))
     confusion.optimal_assignment(num_classes)
-    return confusion.acc(), confusion.clusterscores()
+    return y_pred, kmeans, confusion.acc(), confusion.clusterscores()
 
 
 
@@ -552,7 +550,7 @@ def train_cluster(n_class, dev_embedding, dev_n_sents, dev_target):
 
     embedding = aggregator(x=torch.tensor(dev_embedding, dtype=torch.float, device=device),
                            n_sents=torch.tensor(dev_n_sents, dtype=torch.int, device=device)).cpu().numpy()
-    acc, scores=clustering_single_trial(dev_target, embedding, num_classes=n_class)
+    _, _, acc, scores=clustering_single_trial(dev_target, embedding, num_classes=n_class)
     scores["ACC"]=acc
     return None, scores
 
@@ -647,33 +645,149 @@ def target_distribution(q):
     weight = q**2 / q.sum(0)
     return (weight.t() / weight.sum(1)).t()
 
-def pretrain(args, ae, embedding, patience, pretrain_path=''):
+def pretrain(args, ae, embedding, pretrain_path='', patience = 5):
     if path == '':
-        pretrain_ae(args, ae, embedding, patience)
+        pretrain_path = args.output_path
+        ae = pretrain_ae(args, ae, embedding, pretrain_path, patience)
     else:
-        self.ae.load_state_dict(torch.load(pretrain_path))
+        ae.load_state_dict(torch.load(pretrain_path))
         print(f'load pretrained ae from {pretrain_path}')
-
+    return ae
         
-def pretrain_ae(args, ae, train_embeddings, path='', patience = 5):
+def pretrain_ae(args, ae, train_embedding, pretrain_path, patience):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     optimizer = optim.SGD(ae.parameters(), lr = args.lr)
-    for epoch in tqdm(range(args.n_epoch), desc='train'):
-        total_loss = 0.
+    batch_size = args.batch_size
+    min_loss = 1e6
+    patience_count = 0
+    for epoch in tqdm(range(args.n_epoch), desc='pretrain_ae_train'):
+        epoch_loss = 0.
         for i in range(0, len(train_embedding), args.batch_size):
             x = torch.tensor(train_embedding[i:i + batch_size], dtype=torch.float, device=device)
             optimizer.zero_grad()
             x_prime, _ = ae(x)
-            loss = F.mse_loss(x_prime, x)
-            total_loss += loss.item()
+            loss = F.mse_loss(x_prime.squeeze(1), x)  # [128, 1, 32, 768]
+            epoch_loss += loss.item()
             
             loss.backward()
             optimizer.step()
+        if args.n_epoch % (args.n_epoch / 5) == 0:
+            print("epoch {} loss = {:.4f}".format(epoch, epoch_loss / i))
+        if epoch_loss < min_loss:
+            min_loss = epoch_loss
+            best_model = deepcopy(ae.state_dict())
+        else:
+            patience_count += 1
+            if patience_count == patience:
+                print('early stop')
+                break
+
+    torch.save(ae.state_dict(), pretrain_path + '/ae.pth')
+    print(f"pretrained and saved model to {pretrain_path}.")
+    return ae
+
+
+def train_kfold_idec(args, n_class, embedding, n_sents, target):
+    kf = KFold(args.n_fold)
+    metrics = []
+    for fold, (train_index, dev_index) in enumerate(kf.split(embedding)):
+        train_embedding, train_n_sents, train_target = embedding[train_index], n_sents[train_index], target[train_index]
+        dev_embedding, dev_n_sents, dev_target = embedding[dev_index], n_sents[dev_index], target[dev_index]
+        cnn_idec, eval_metric = train_idec(args, n_class, train_embedding, train_n_sents, train_target,
+                                                       dev_embedding, dev_n_sents, dev_target,
+                                                       args.n_epoch, args.batch_size, args.lr, args.patience)
+        metrics.append(eval_metric)
+
+    avg_metric = {k: 0 for k in metrics[0].keys()}
+    for key in avg_metric.keys():
+        avg_metric[key] = sum([metrics[i][key] for i in range(len(metrics))]) / args.n_fold
+    return avg_metric
+    
+    
+def train_idec(args, n_class, train_embedding, train_n_sents, train_target,
+                     dev_embedding, dev_n_sents, dev_target,
+                     n_epoch, batch_size=1, lr=1e-3, patience=5):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def eval(model, dev_embedding, dev_n_sents, dev_target, y_pred_last, batch_size=1):
+        from sklearn.metrics.cluster import normalized_mutual_info_score as nmi
+        from sklearn.metrics.cluster import adjusted_rand_score as ari
+        from sklearn.metrics.cluster import adjusted_mutual_info_score as ami
+        from RetMetric import cluster_acc
+        assert isinstance(model, nn.Module)
+        model = model.to(device).eval()
+        for p in model.parameters():
+            p.requires_grad = False
+        step, ACC, NMI, ARI, AMI = 0, 0, 0, 0, 0
+        with torch.no_grad():
+            for i in tqdm(range(0, len(dev_embedding), batch_size), desc='eval'):
+                step += 1
+                embeddings = torch.tensor(dev_embedding[i:i + batch_size], dtype=torch.float, device=device)
+                n_sents = torch.tensor(dev_n_sents[i:i + batch_size], dtype=torch.int, device=device)
+                _, tmp_q = model(embeddings, n_sents)  # (b, n_class)
+                tmp_q = tmp_q.data
+                p = target_distribution(tmp_q)
+                y_pred = tmp_q.cpu().numpy().argmax(1)
+                delta_label = np.sum(y_pred != y_pred_last).astype(np.float32) / y_pred.shape[0]
+                y_pred_last = y_pred
+                ACC += cluster_acc(dev_target, y_pred)
+                NMI += nmi(dev_target, y_pred)
+                ARI += ari(dev_target, y_pred)
+                AMI += ami(dev_target, y_pred)
+
+        res = {'ACC' : ACC / step, 'NMI' : NMI / step, 'ARI' : ARI / step, 'AMI' : AMI / step}
+        return res, delta_label
+                
+    
+    ### pretrain AE
+    model = IDEC(d_model = 768, n_emb = 256, n_cluster = n_class).to(device)
+    assert isinstance(model, nn.Module)
+    model.ae = pretrain_ae(args, model.ae, train_embedding, pretrain_path = args.output_path, patience = patience)
+    
+    ### cluster paramater initiate
+    x = torch.tensor(train_embedding, dtype=torch.float, device=device)
+    y = train_target
+    x_prime, z = model.ae(x)
+    
+    y_pred, kmeans, acc, scores = clustering_single_trial(y, z.flatten(1), num_classes=n_class)
+    
+    x_prime = None
+    z = None
+    
+    model.cluster_layer.data = torch.tensor(kmeans.cluster_centers_).to(device)
+    
+    ### training within an epoch
+    optimizer = optim.SGD(model.parameters(), lr=lr)
+    patience_count = 0
+    
+    model.train()
+    for epoch in tqdm(range(n_epoch), desc='train'):
+        epoch_loss = 0
+        ### update p distribution
+        _, tmp_q = model(x)
+        tmp_q = tmp_q.data
+        p = target_distribution(tmp_q)
+        for i in range(0, len(train_embedding), batch_size):
+            x = torch.tensor(train_embedding[i:i + batch_size], dtype=torch.float, device=device)
+            n_sents = torch.tensor(train_n_sents[i:i+batch_size], dtype=torch.int, device=device)
+            targets = torch.tensor(train_target[i:i + batch_size], device=device)
+            x_prime, q = model(x)
             
-        print("epoch {} loss = {:.4f}".format(epoch, total_loss / i))
-        torch.save(ae.state_dict(), pretrain_path)
-        
-    print(f"model saved to {pretrain_path}.")
+            reconstr_loss = F.mse_loss(x_prime.squeeze(1), x)
+            kl_loss = F.kl_div(q.log(), p[i:i+batch_size], reduction = 'mean')
+            loss = args.gamma * kl_loss + reconstr_loss
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+        print("epoch {} loss = {:.4f}".format(epoch, epoch_loss / i))
+        eval_metric, delta_label = eval(model, dev_embedding, dev_n_sents, dev_target, y_pred, batch_size)
+        if epoch > 0 and delta_label > args.tol:
+            print('delta_label {:.4f}'.format(delta_label), '< tol', args.tol)
+            print('Reached tolerance threshold. Stopping training.')
+            best_model = deepcopy(model).cpu()
+            break
+    return best_model, eval_metric
 
 def dataset_training(dataset, args):
     logging.info('Training on {}'.format(dataset))
@@ -694,6 +808,9 @@ def dataset_training(dataset, args):
 
     else:
         print(f"preparing embedding bank for {dataset}")
+        # embedding = np.ones((256, 32, 768))
+        # target = np.ones((256,))
+        # n_class = 8
         embedding, target, n_class = get_embedding_bank(dataset, args)
         print(f"""save to {args.output_path+f"/{dataset}_embedding_bank.pt"}""")
         torch.save({"embedding":embedding,
@@ -733,8 +850,18 @@ def dataset_training(dataset, args):
         for key, val in eval_metric.items():
             print(f"{key}::{val}")
             logging.info(f"{key}::{val}")
+    
+    
+    if args.do_idec:
+        print("idec")
+        logging.info("idec")
+        _,eval_metric = train_kfold_idec(args, n_class, embedding, n_sents, target)
+        for key, val in eval_metric.items():
+            print(f"{key}::{val}")
+            logging.info(f"{key}::{val}")
+        
+        
     print("done")
-
 
 
 
@@ -770,7 +897,7 @@ def main():
 
     parser.add_argument("--is_debug", action="store_true")
     parser.add_argument("--n_fold", type=int, default=5)
-    parser.add_argument("--n_epoch", type=int, default=1000)
+    parser.add_argument("--n_epoch", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--patience", type=int, default=5)
@@ -779,6 +906,11 @@ def main():
                         help="use this to run clustering")
     parser.add_argument("--do_prediction", action="store_true",
                         help="use this for prediction")
+    parser.add_argument("--do_idec", action="store_true",
+                        help="use this for prediction")
+    parser.add_argument("--tol", type = float, default=0.001,
+                        help="use this for IDEC early stopping")
+    parser.add_argument('--gamma', default=0.1, type=float, help='coefficient of clustering loss')
 
     args = parser.parse_args()
     assert args.datasets in DATASETS+["all"]
