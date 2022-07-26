@@ -30,7 +30,7 @@ class IDEC(nn.Module):
         super(IDEC, self).__init__()
         self.alpha = alpha
         self.ae = CNNPoolingAE(d_model, n_emb)
-        self.cluster_layer = nn.Parameter(torch.Tensor(n_cluster, n_emb))
+        self.cluster_layer = nn.Parameter(torch.Tensor(n_cluster, n_emb), requires_grad = True)
         torch.nn.init.xavier_uniform_(self.cluster_layer.data)
     
     def forward(self, x, n_sents=None):
@@ -66,6 +66,7 @@ class CNNPoolingAE(nn.Module):
         f2 = self.tcnn2(f2)
         f3 = self.tcnn3(f3)
         x_prime = f1 + f2 + f3
+        x_prime = x_prime.squeeze(1) # [b, 1, n, c] -> [b, n, c]
         return x_prime, z
 
 
@@ -580,8 +581,8 @@ def train_classifier(n_class, train_embedding, train_n_sents, train_target,
         assert isinstance(cls, nn.Module)
         cls = cls.to(device)
         cls = cls.eval()
-        for p in cls.parameters():
-            p.requires_grad = False
+        # for p in cls.parameters():
+        #     p.requires_grad = False
         predicted_bank = []
         with torch.no_grad():
             for i in tqdm(range(0, len(dev_embedding), batch_size), desc='eval'):
@@ -645,24 +646,27 @@ def target_distribution(q):
     weight = q**2 / q.sum(0)
     return (weight.t() / weight.sum(1)).t()
 
-def pretrain(args, ae, embedding, pretrain_path='', patience = 5):
-    if path == '':
+def pretrain(dataset, args, ae, embedding, pretrain_path='', patience = 5):
+    ae_file = pretrain_path+f"/{dataset}_ae.pt"
+    if not os.path.exists(ae_file):
         pretrain_path = args.output_path
-        ae = pretrain_ae(args, ae, embedding, pretrain_path, patience)
+        ae = pretrain_ae(args, ae, embedding, ae_file, patience)
     else:
-        ae.load_state_dict(torch.load(pretrain_path))
-        print(f'load pretrained ae from {pretrain_path}')
+        ae.load_state_dict(torch.load(ae_file))
+        print(f'load pretrained AE from {ae_file}')
     return ae
         
-def pretrain_ae(args, ae, train_embedding, pretrain_path, patience):
+def pretrain_ae(args, ae, train_embedding, ae_file, patience):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     optimizer = optim.SGD(ae.parameters(), lr = args.lr)
     batch_size = args.batch_size
     min_loss = 1e6
     patience_count = 0
-    for epoch in tqdm(range(args.n_epoch), desc='pretrain_ae_train'):
+    for epoch in tqdm(range(args.n_epoch), desc='AE TRAINING'):
         epoch_loss = 0.
+        step = 0
         for i in range(0, len(train_embedding), args.batch_size):
+            step += 1
             x = torch.tensor(train_embedding[i:i + batch_size], dtype=torch.float, device=device)
             optimizer.zero_grad()
             x_prime, _ = ae(x)
@@ -672,7 +676,7 @@ def pretrain_ae(args, ae, train_embedding, pretrain_path, patience):
             loss.backward()
             optimizer.step()
         if args.n_epoch % (args.n_epoch / 5) == 0:
-            print("epoch {} loss = {:.4f}".format(epoch, epoch_loss / i))
+            print("epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
         if epoch_loss < min_loss:
             min_loss = epoch_loss
             best_model = deepcopy(ae.state_dict())
@@ -682,18 +686,18 @@ def pretrain_ae(args, ae, train_embedding, pretrain_path, patience):
                 print('early stop')
                 break
 
-    torch.save(ae.state_dict(), pretrain_path + '/ae.pth')
-    print(f"pretrained and saved model to {pretrain_path}.")
+    torch.save(ae.state_dict(), ae_file)
+    print(f"pretrained and saved model to {ae_file}.")
     return ae
 
 
-def train_kfold_idec(args, n_class, embedding, n_sents, target):
+def train_kfold_idec(dataset, args, n_class, embedding, n_sents, target):
     kf = KFold(args.n_fold)
     metrics = []
     for fold, (train_index, dev_index) in enumerate(kf.split(embedding)):
         train_embedding, train_n_sents, train_target = embedding[train_index], n_sents[train_index], target[train_index]
         dev_embedding, dev_n_sents, dev_target = embedding[dev_index], n_sents[dev_index], target[dev_index]
-        cnn_idec, eval_metric = train_idec(args, n_class, train_embedding, train_n_sents, train_target,
+        cnn_idec, eval_metric = train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_target,
                                                        dev_embedding, dev_n_sents, dev_target,
                                                        args.n_epoch, args.batch_size, args.lr, args.patience)
         metrics.append(eval_metric)
@@ -701,10 +705,10 @@ def train_kfold_idec(args, n_class, embedding, n_sents, target):
     avg_metric = {k: 0 for k in metrics[0].keys()}
     for key in avg_metric.keys():
         avg_metric[key] = sum([metrics[i][key] for i in range(len(metrics))]) / args.n_fold
-    return avg_metric
+    return cnn_idec, avg_metric
     
     
-def train_idec(args, n_class, train_embedding, train_n_sents, train_target,
+def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_target,
                      dev_embedding, dev_n_sents, dev_target,
                      n_epoch, batch_size=1, lr=1e-3, patience=5):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -714,25 +718,25 @@ def train_idec(args, n_class, train_embedding, train_n_sents, train_target,
         from sklearn.metrics.cluster import adjusted_mutual_info_score as ami
         from RetMetric import cluster_acc
         assert isinstance(model, nn.Module)
-        model = model.to(device).eval()
-        for p in model.parameters():
-            p.requires_grad = False
-        step, ACC, NMI, ARI, AMI = 0, 0, 0, 0, 0
+        model.eval()
+        ACC, NMI, ARI, AMI, step = 0, 0, 0, 0, 0
         with torch.no_grad():
-            for i in tqdm(range(0, len(dev_embedding), batch_size), desc='eval'):
+            for i in range(0, len(dev_embedding), args.batch_size):
                 step += 1
-                embeddings = torch.tensor(dev_embedding[i:i + batch_size], dtype=torch.float, device=device)
-                n_sents = torch.tensor(dev_n_sents[i:i + batch_size], dtype=torch.int, device=device)
-                _, tmp_q = model(embeddings, n_sents)  # (b, n_class)
+                x = torch.tensor(dev_embedding[i:i + args.batch_size], dtype = torch.float, device=device)
+                n_sents = dev_n_sents[i:i + args.batch_size].to(device)
+                _, tmp_q = model(x, n_sents)  # (b, n_class)
                 tmp_q = tmp_q.data
                 p = target_distribution(tmp_q)
                 y_pred = tmp_q.cpu().numpy().argmax(1)
+                if y_pred.shape[0] != y_pred_last.shape[0]:
+                    y_pred_last = y_pred_last[i:i + args.batch_size]
                 delta_label = np.sum(y_pred != y_pred_last).astype(np.float32) / y_pred.shape[0]
                 y_pred_last = y_pred
-                ACC += cluster_acc(dev_target, y_pred)
-                NMI += nmi(dev_target, y_pred)
-                ARI += ari(dev_target, y_pred)
-                AMI += ami(dev_target, y_pred)
+                ACC += cluster_acc(dev_target[i:i + args.batch_size], y_pred)
+                NMI += nmi(dev_target[i:i + args.batch_size], y_pred)
+                ARI += ari(dev_target[i:i + args.batch_size], y_pred)
+                AMI += ami(dev_target[i:i + args.batch_size], y_pred)
 
         res = {'ACC' : ACC / step, 'NMI' : NMI / step, 'ARI' : ARI / step, 'AMI' : AMI / step}
         return res, delta_label
@@ -741,18 +745,16 @@ def train_idec(args, n_class, train_embedding, train_n_sents, train_target,
     ### pretrain AE
     model = IDEC(d_model = 768, n_emb = 256, n_cluster = n_class).to(device)
     assert isinstance(model, nn.Module)
-    model.ae = pretrain_ae(args, model.ae, train_embedding, pretrain_path = args.output_path, patience = patience)
+    model.ae = pretrain(dataset, args, model.ae, train_embedding, pretrain_path = args.output_path, patience = patience)
     
     ### cluster paramater initiate
     x = torch.tensor(train_embedding, dtype=torch.float, device=device)
     y = train_target
-    x_prime, z = model.ae(x)
+    _, z = model.ae(x)
     
     y_pred, kmeans, acc, scores = clustering_single_trial(y, z.flatten(1), num_classes=n_class)
-    
-    x_prime = None
-    z = None
-    
+    del z
+    torch.cuda.empty_cache()
     model.cluster_layer.data = torch.tensor(kmeans.cluster_centers_).to(device)
     
     ### training within an epoch
@@ -760,27 +762,32 @@ def train_idec(args, n_class, train_embedding, train_n_sents, train_target,
     patience_count = 0
     
     model.train()
-    for epoch in tqdm(range(n_epoch), desc='train'):
+    for epoch in tqdm(range(n_epoch), desc='IDEC TRAINING'):
         epoch_loss = 0
+        step = 0
         ### update p distribution
         _, tmp_q = model(x)
         tmp_q = tmp_q.data
         p = target_distribution(tmp_q)
-        for i in range(0, len(train_embedding), batch_size):
-            x = torch.tensor(train_embedding[i:i + batch_size], dtype=torch.float, device=device)
-            n_sents = torch.tensor(train_n_sents[i:i+batch_size], dtype=torch.int, device=device)
-            targets = torch.tensor(train_target[i:i + batch_size], device=device)
-            x_prime, q = model(x)
+        del tmp_q
+        torch.cuda.empty_cache()
+        for i in range(0, len(x), batch_size):
+            step += 1
+            tmp_x = x[i:i + batch_size]
+            n_sents = train_n_sents[i:i+batch_size].to(device)
+            target = torch.tensor(train_target[i:i+batch_size], device=device)
+            x_prime, q = model(tmp_x)
             
-            reconstr_loss = F.mse_loss(x_prime.squeeze(1), x)
-            kl_loss = F.kl_div(q.log(), p[i:i+batch_size], reduction = 'mean')
+            reconstr_loss = F.mse_loss(x_prime.squeeze(1), tmp_x)
+            kl_loss = F.kl_div(q.log(), p[i:i+batch_size], reduction = 'batchmean')
             loss = args.gamma * kl_loss + reconstr_loss
             
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
-        print("epoch {} loss = {:.4f}".format(epoch, epoch_loss / i))
+        if args.n_epoch % (args.n_epoch / 5) == 0:
+            print("epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
         eval_metric, delta_label = eval(model, dev_embedding, dev_n_sents, dev_target, y_pred, batch_size)
         if epoch > 0 and delta_label > args.tol:
             print('delta_label {:.4f}'.format(delta_label), '< tol', args.tol)
@@ -855,7 +862,7 @@ def dataset_training(dataset, args):
     if args.do_idec:
         print("idec")
         logging.info("idec")
-        _,eval_metric = train_kfold_idec(args, n_class, embedding, n_sents, target)
+        _,eval_metric = train_kfold_idec(dataset, args, n_class, embedding, n_sents, target)
         for key, val in eval_metric.items():
             print(f"{key}::{val}")
             logging.info(f"{key}::{val}")
@@ -873,23 +880,23 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path",
-                        default="bert-base-uncased",
+                        # default="bert-base-uncased",
                         # default="nli-bert-base",
-                        # default="/raid1/p3/jiahao/simsiam/runs/my-sup-simcse-bert-base-uncased"
+                        default="/raid1/p3/jiahao/simsiam/runs/my-sup-simcse-bert-base-uncased"
                         # default="/raid1/p3/jiahao/simsiam/runs/bert_nli_64seqlen/checkpoints.cp"
                         )
 
     parser.add_argument("--model_type",
-                        default="plm",
+                        # default="plm",
                         # default="sbert",
-                        # default="simcse",
+                        default="simcse",
                         # default="blendrst",
                         help="plm is origianl pretrained lm, sbert is sentence bert, simcse is Simcse, and blendrst is our method")
 
     parser.add_argument("--output_path",
-                        default="/raid1/p3/jiahao/simsiam/runs/document_leve/bert-base-uncased-test",
+                        # default="/raid1/p3/jiahao/simsiam/runs/document_leve/bert-base-uncased-test",
                         # default="/raid1/p3/jiahao/simsiam/runs/document_leve/sbert-nli",
-                        # default="/raid1/p3/jiahao/simsiam/runs/document_leve/sup-simcse-bert",
+                        default="/raid1/p3/jiahao/simsiam/runs/document_level/sup-simcse-bert",
                         # default="/raid1/p3/jiahao/simsiam/runs/document_leve/blendrst-bert-nli"
                         )
 
@@ -898,7 +905,7 @@ def main():
     parser.add_argument("--is_debug", action="store_true")
     parser.add_argument("--n_fold", type=int, default=5)
     parser.add_argument("--n_epoch", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--datasets", default="all", type=str)
