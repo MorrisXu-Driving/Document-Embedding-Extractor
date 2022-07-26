@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import transformers
-from RetMetric import RetMetric
+from RetMetric import RetMetric, cluster_acc
 from nltk.tokenize import sent_tokenize
 from sklearn.datasets import fetch_20newsgroups
 from sklearn.metrics import precision_recall_fscore_support
@@ -45,28 +45,26 @@ class IDEC(nn.Module):
 class CNNPoolingAE(nn.Module):
     def __init__(self, d_model, n_emb):
         super(CNNPoolingAE, self).__init__()
-        c = d_model // 3
+        self.c = d_model // 3
         
         self.encoder = CNNPoolingClassifier(d_model, n_emb)
         
-        self.tcnn1 = nn.Sequential(nn.ConvTranspose2d(c, 1, (2, d_model), padding=[1,0]), nn.ReLU(inplace=True))
-        self.tcnn2 = nn.Sequential(nn.ConvTranspose2d(c, 1, (3, d_model), padding=[1,0]), nn.ReLU(inplace=True))
-        self.tcnn3 = nn.Sequential(nn.ConvTranspose2d(c, 1, (4, d_model), padding=[1,0]), nn.ReLU(inplace=True))
+        self.tcnn1 = nn.ConvTranspose2d(self.c, 1, (2, d_model), padding=[1,0])
+        self.tcnn2 = nn.ConvTranspose2d(self.c, 1, (3, d_model), padding=[1,0])
+        self.tcnn3 = nn.ConvTranspose2d(self.c, 1, (4, d_model), padding=[1,0])
 
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
-    def pretrain(self, path = ''):
-        if path == '':
-            pretrain_ae(self.ae)
 
     def forward(self, x, n_sents=None):
         z, f1, f2, f3 = self.encoder(x)
-        f1 = self.tcnn1(f1)
-        f2 = self.tcnn2(f2)
-        f3 = self.tcnn3(f3)
-        x_prime = f1 + f2 + f3
-        x_prime = x_prime.squeeze(1) # [b, 1, n, c] -> [b, n, c]
+        f1 = self.tcnn1(F.relu(f1, inplace = True))
+        f2 = self.tcnn2(F.relu(f2, inplace = True))
+        f3 = self.tcnn3(F.relu(f3, inplace = True))
+        # x_prime = f1 + f2 + f3
+        x_prime = torch.concat([f1, f2, f3], dim = 1).mean(1)
+        # x_prime = x_prime.squeeze(1) # [b, 1, n, c] -> [b, n, c]
         return x_prime, z
 
 
@@ -99,7 +97,7 @@ class CNNPoolingClassifier(nn.Module):
         f2 = self.cnn2(x)  # [b, c, n, 1]
         f3 = self.cnn3(x)  # [b, c, n, 1]
 
-        doc_embedding = torch.relu(torch.cat([self.pooling(f1.squeeze(-1)), self.pooling(f2.squeeze(-1)), self.pooling(f3.squeeze(-1))], dim=1))  # [b, d_model]
+        doc_embedding = F.relu(torch.cat([self.pooling(f1.squeeze(-1)), self.pooling(f2.squeeze(-1)), self.pooling(f3.squeeze(-1))], dim=1))  # [b, d_model]
         output = self.cls(doc_embedding)
         return output, f1, f2, f3
 
@@ -581,8 +579,6 @@ def train_classifier(n_class, train_embedding, train_n_sents, train_target,
         assert isinstance(cls, nn.Module)
         cls = cls.to(device)
         cls = cls.eval()
-        # for p in cls.parameters():
-        #     p.requires_grad = False
         predicted_bank = []
         with torch.no_grad():
             for i in tqdm(range(0, len(dev_embedding), batch_size), desc='eval'):
@@ -662,21 +658,23 @@ def pretrain_ae(args, ae, train_embedding, ae_file, patience):
     batch_size = args.batch_size
     min_loss = 1e6
     patience_count = 0
-    for epoch in tqdm(range(args.n_epoch), desc='AE TRAINING'):
+    for epoch in tqdm(range(2), desc='AE TRAINING'):
         epoch_loss = 0.
         step = 0
-        for i in range(0, len(train_embedding), args.batch_size):
+        for i in range(0, len(train_embedding), batch_size):
             step += 1
             x = torch.tensor(train_embedding[i:i + batch_size], dtype=torch.float, device=device)
-            optimizer.zero_grad()
             x_prime, _ = ae(x)
-            loss = F.mse_loss(x_prime.squeeze(1), x)  # [128, 1, 32, 768]
-            epoch_loss += loss.item()
+            loss = F.mse_loss(x_prime, x)  # [b, n, c]
             
             loss.backward()
             optimizer.step()
-        if args.n_epoch % (args.n_epoch / 5) == 0:
-            print("epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
+            optimizer.zero_grad()
+            epoch_loss += loss.item()
+            
+        if epoch % (args.n_epoch / 5) == 0:
+            print("AE pretrain epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
+            logging.info("AE pretrain epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
         if epoch_loss < min_loss:
             min_loss = epoch_loss
             best_model = deepcopy(ae.state_dict())
@@ -716,7 +714,6 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
         from sklearn.metrics.cluster import normalized_mutual_info_score as nmi
         from sklearn.metrics.cluster import adjusted_rand_score as ari
         from sklearn.metrics.cluster import adjusted_mutual_info_score as ami
-        from RetMetric import cluster_acc
         assert isinstance(model, nn.Module)
         model.eval()
         ACC, NMI, ARI, AMI, step = 0, 0, 0, 0, 0
@@ -751,11 +748,10 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
     x = torch.tensor(train_embedding, dtype=torch.float, device=device)
     y = train_target
     _, z = model.ae(x)
-    
-    y_pred, kmeans, acc, scores = clustering_single_trial(y, z.flatten(1), num_classes=n_class)
-    del z
+    y_pred, kmeans, acc, scores = clustering_single_trial(y, z, num_classes=n_class)
+    model.cluster_layer.data = torch.tensor(kmeans.cluster_centers_, dtype = torch.float, device = device)
+    del z, x
     torch.cuda.empty_cache()
-    model.cluster_layer.data = torch.tensor(kmeans.cluster_centers_).to(device)
     
     ### training within an epoch
     optimizer = optim.SGD(model.parameters(), lr=lr)
@@ -766,19 +762,25 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
         epoch_loss = 0
         step = 0
         ### update p distribution
-        _, tmp_q = model(x)
-        tmp_q = tmp_q.data
-        p = target_distribution(tmp_q)
-        del tmp_q
+        for i in range(0, len(train_embedding), batch_size):
+            x = torch.tensor(train_embedding[i:i+batch_size], dtype=torch.float, device=device)
+            _, tmp_q = model(x)
+            tmp_p = target_distribution(tmp_q.detach())
+            if i == 0:
+                p = tmp_p
+            else:
+                p = torch.concat([p, tmp_p], dim = 0)
+        del tmp_q, x
         torch.cuda.empty_cache()
-        for i in range(0, len(x), batch_size):
+        
+        for i in range(0, len(train_embedding), batch_size):
             step += 1
-            tmp_x = x[i:i + batch_size]
+            tmp_x = torch.tensor(train_embedding[i:i+batch_size], dtype=torch.float, device=device)
             n_sents = train_n_sents[i:i+batch_size].to(device)
             target = torch.tensor(train_target[i:i+batch_size], device=device)
             x_prime, q = model(tmp_x)
             
-            reconstr_loss = F.mse_loss(x_prime.squeeze(1), tmp_x)
+            reconstr_loss = F.mse_loss(x_prime, tmp_x)
             kl_loss = F.kl_div(q.log(), p[i:i+batch_size], reduction = 'batchmean')
             loss = args.gamma * kl_loss + reconstr_loss
             
@@ -786,8 +788,9 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
-        if args.n_epoch % (args.n_epoch / 5) == 0:
+        if epoch % (args.n_epoch / 5) == 0:
             print("epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
+            logging.info("IDEC train epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
         eval_metric, delta_label = eval(model, dev_embedding, dev_n_sents, dev_target, y_pred, batch_size)
         if epoch > 0 and delta_label > args.tol:
             print('delta_label {:.4f}'.format(delta_label), '< tol', args.tol)
@@ -905,7 +908,7 @@ def main():
     parser.add_argument("--is_debug", action="store_true")
     parser.add_argument("--n_fold", type=int, default=5)
     parser.add_argument("--n_epoch", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--datasets", default="all", type=str)
