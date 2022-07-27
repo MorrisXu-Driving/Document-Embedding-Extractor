@@ -74,7 +74,7 @@ class CNNPoolingAE(nn.Module):
         x_prime_2 = self.tcnn2(F.relu(f2, inplace = True))
         x_prime_3 = self.tcnn3(F.relu(f3, inplace = True))
         # x_prime = x_prime_1 + x_prime_2 + x_prime_3
-        x_prime = torch.concat([f1, f2, f3], dim = 1).mean(1)
+        x_prime = torch.concat([x_prime_1, x_prime_2, x_prime_3], dim = 1).mean(1)
         # x_prime = x_prime.squeeze(1) # [b, 1, n, c] -> [b, n, c]
         return x_prime, z
 
@@ -931,7 +931,6 @@ def dataset_training(dataset, args):
 
 
 DATASETS=['20ng', 'reuters', 'mr', 'fake_news', 'corona']
-
 def main():
 
     parser = argparse.ArgumentParser()
