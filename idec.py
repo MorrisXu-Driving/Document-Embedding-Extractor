@@ -49,6 +49,12 @@ class CNNPoolingAE(nn.Module):
         
         self.encoder = CNNPoolingClassifier(d_model, n_emb)
         
+        self.cls = nn.Sequential(nn.Linear(n_emb, d_model),
+                                 nn.ReLU(inplace=True),
+                                 nn.Linear(d_model, d_model),
+                                 nn.ReLU(inplace=True),
+                                 nn.Linear(d_model, d_model))
+        
         self.tcnn1 = nn.ConvTranspose2d(self.c, 1, (2, d_model), padding=[1,0])
         self.tcnn2 = nn.ConvTranspose2d(self.c, 1, (3, d_model), padding=[1,0])
         self.tcnn3 = nn.ConvTranspose2d(self.c, 1, (4, d_model), padding=[1,0])
@@ -58,13 +64,18 @@ class CNNPoolingAE(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, x, n_sents=None):
-        z, f1, f2, f3 = self.encoder(x)
-        f1 = self.tcnn1(F.relu(f1, inplace = True))
-        f2 = self.tcnn2(F.relu(f2, inplace = True))
-        f3 = self.tcnn3(F.relu(f3, inplace = True))
-        # x_prime = f1 + f2 + f3
-        x_prime = torch.concat([f1, f2, f3], dim = 1).mean(1)
-        # x_prime = x_prime.squeeze(1) # [b, 1, n, c] -> [b, n, c]
+        z, _, _, _ = self.encoder(x)
+        z = self.cls(z)
+        f1 = z[:, :self.c].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, 33, 1)
+        f2 = z[:, self.c:2*self.c].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, 32, 1)
+        f3 = z[:, 2*self.c:].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, 31, 1)
+        
+        x_prime_1 = self.tcnn1(F.relu(f1, inplace = True))
+        x_prime_2 = self.tcnn2(F.relu(f2, inplace = True))
+        x_prime_3 = self.tcnn3(F.relu(f3, inplace = True))
+        x_prime = x_prime_1 + x_prime_2 + x_prime_3
+        # x_prime = torch.concat([f1, f2, f3], dim = 1).mean(1)
+        x_prime = x_prime.squeeze(1) # [b, 1, n, c] -> [b, n, c]
         return x_prime, z
 
 
@@ -658,11 +669,12 @@ def pretrain(dataset, args, ae, embedding, pretrain_path='', patience = 5):
         
 def pretrain_ae(args, ae, train_embedding, ae_file, patience):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    optimizer = optim.SGD(ae.parameters(), lr = args.lr)
+    optimizer = optim.Adam(ae.parameters(), lr = args.lr)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size = 10, gamma=0.5)
     batch_size = args.batch_size
     min_loss = 1e6
     patience_count = 0
-    for epoch in tqdm(range(2), desc='AE TRAINING'):
+    for epoch in tqdm(range(args.n_epoch), desc='AE TRAINING'):
         epoch_loss = 0.
         step = 0
         for i in range(0, len(train_embedding), batch_size):
@@ -675,8 +687,9 @@ def pretrain_ae(args, ae, train_embedding, ae_file, patience):
             optimizer.step()
             optimizer.zero_grad()
             epoch_loss += loss.item()
+        scheduler.step()
             
-        if epoch % (args.n_epoch / 5) == 0:
+        if (epoch + 1) % 5 == 0:
             print("AE pretrain epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
             logging.info("AE pretrain epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
         if epoch_loss < min_loss:
@@ -766,8 +779,9 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
     del z, x
     torch.cuda.empty_cache()
     
-    ### training within an epoch
+    ### training program
     optimizer = optim.SGD(model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size = 10, gamma=0.5)
     patience_count = 0
     min_delta_label = 1.
     
@@ -818,8 +832,9 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
-            
-        if epoch % (args.n_epoch / 5) == 0:
+        scheduler.step()
+        
+        if (epoch + 1) % 5 == 0:
             print("epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
             logging.info("IDEC train epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
             
@@ -833,7 +848,7 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
             if patience_count == patience:
                 print('Early stopping training.')
                 break
-            
+        
     return best_model, eval_metric
 
 def dataset_training(dataset, args):
@@ -956,9 +971,7 @@ def main():
                         help="use this for prediction")
     parser.add_argument("--do_idec", action="store_true",
                         help="use this for prediction")
-    parser.add_argument("--tol", type = float, default=0.001,
-                        help="use this for IDEC early stopping")
-    parser.add_argument('--gamma', default=0.1, type=float, help='coefficient of clustering loss')
+    parser.add_argument('--gamma', default=0.5, type=float, help='coefficient of clustering loss')
 
     args = parser.parse_args()
     assert args.datasets in DATASETS+["all"]
