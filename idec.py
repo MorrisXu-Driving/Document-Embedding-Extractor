@@ -353,7 +353,7 @@ def get_sent_embedding(docs, args):
                         sent_embeddings = ((model(**batch).last_hidden_state)*(batch["attention_mask"].unsqueeze(-1))).sum(dim=1)/batch["attention_mask"].sum(dim=-1, keepdim=True)
                 else:
                     sent_embeddings = model(batch["input_ids"], batch["attention_mask"].sum(dim=-1))
-                sent_embeddings = sent_embeddings.cpu().numpy()
+                sent_embeddings = sent_embeddings.cpu().detach().numpy()
             embedding_bank.extend(sent_embeddings)
         return embedding_bank
 
@@ -483,7 +483,7 @@ class Confusion(object):
 
     def optimal_assignment(self, gt_n_cluster=None, assign=None):
         if assign is None:
-            mat = -self.conf.cpu().numpy()  # hungaian finds the minimum cost
+            mat = -self.conf.cpu().detach().numpy()  # hungaian finds the minimum cost
             r, assign = hungarian(mat)
         self.conf = self.conf[:, assign]
         self.gt_n_cluster = gt_n_cluster
@@ -534,7 +534,11 @@ class Confusion(object):
 def clustering_single_trial(y_true, embeddings=None, num_classes=10, random_state=0):
     """"Evaluate the embeddings using KMeans"""
     kmeans = cluster.KMeans(n_clusters=num_classes, random_state=random_state)
-    kmeans.fit(embeddings.cpu().detach().numpy())
+    if isinstance(embeddings, torch.Tensor):
+        kmeans.fit(embeddings.cpu().detach().numpy())
+    else:
+        kmeans.fit(embeddings)
+    
     y_pred = kmeans.labels_.astype(np.int)
 
     confusion = Confusion(num_classes)
@@ -725,15 +729,18 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
                 _, tmp_q = model(x, n_sents)  # (b, n_class)
                 tmp_q = tmp_q.data
                 p = target_distribution(tmp_q)
-                y_pred = tmp_q.cpu().numpy().argmax(1)
-                if y_pred.shape[0] != y_pred_last.shape[0]:
-                    y_pred_last = y_pred_last[i:i + args.batch_size]
-                delta_label = np.sum(y_pred != y_pred_last).astype(np.float32) / y_pred.shape[0]
-                y_pred_last = y_pred
-                ACC += cluster_acc(dev_target[i:i + args.batch_size], y_pred)
-                NMI += nmi(dev_target[i:i + args.batch_size], y_pred)
-                ARI += ari(dev_target[i:i + args.batch_size], y_pred)
-                AMI += ami(dev_target[i:i + args.batch_size], y_pred)
+                y_pred_tmp = tmp_q.cpu().detach().numpy().argmax(1)
+                if i == 0:
+                    y_pred = y_pred_tmp
+                else:
+                    y_pred = np.concatenate([y_pred, y_pred_tmp], axis = 0)
+                ACC += cluster_acc(dev_target[i:i + args.batch_size], y_pred[i:i + args.batch_size])
+                NMI += nmi(dev_target[i:i + args.batch_size], y_pred[i:i + args.batch_size])
+                ARI += ari(dev_target[i:i + args.batch_size], y_pred[i:i + args.batch_size])
+                AMI += ami(dev_target[i:i + args.batch_size], y_pred[i:i + args.batch_size])
+                
+        delta_label = np.sum(y_pred != y_pred_last).astype(np.float32) / y_pred.shape[0]
+        y_pred_last = y_pred
 
         res = {'ACC' : ACC / step, 'NMI' : NMI / step, 'ARI' : ARI / step, 'AMI' : AMI / step}
         return res, delta_label
@@ -744,11 +751,17 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
     assert isinstance(model, nn.Module)
     model.ae = pretrain(dataset, args, model.ae, train_embedding, pretrain_path = args.output_path, patience = patience)
     
-    ### cluster paramater initiate
-    x = torch.tensor(train_embedding, dtype=torch.float, device=device)
-    y = train_target
-    _, z = model.ae(x)
-    y_pred, kmeans, acc, scores = clustering_single_trial(y, z, num_classes=n_class)
+    ### batchified cluster paramater initialization
+    with torch.no_grad():
+        for i in range(0, len(train_embedding), batch_size):
+            x = torch.tensor(train_embedding[i:i+batch_size], dtype=torch.float, device=device)
+            _, z_tmp = model.ae(x)
+            z_tmp = z_tmp.cpu().detach().numpy()
+            if i == 0:
+                z = z_tmp
+            else:
+                z = np.concatenate([z, z_tmp], axis = 0)
+    _, kmeans, _, _ = clustering_single_trial(train_target, z, num_classes=n_class)
     model.cluster_layer.data = torch.tensor(kmeans.cluster_centers_, dtype = torch.float, device = device)
     del z, x
     torch.cuda.empty_cache()
@@ -756,11 +769,27 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
     ### training within an epoch
     optimizer = optim.SGD(model.parameters(), lr=lr)
     patience_count = 0
+    min_delta_label = 1.
     
     model.train()
     for epoch in tqdm(range(n_epoch), desc='IDEC TRAINING'):
         epoch_loss = 0
         step = 0
+        
+        ### compute y_pred_last for dev_embedding
+        with torch.no_grad():
+            for i in range(0, len(dev_embedding), batch_size):
+                x = torch.tensor(dev_embedding[i:i+batch_size], dtype=torch.float, device=device)
+                _, z_tmp = model.ae(x)
+                z_tmp = z_tmp.cpu().detach().numpy()
+                if i == 0:
+                    z = z_tmp
+                else:
+                    z = np.concatenate([z, z_tmp], axis = 0)
+        y_pred, _, _, _ = clustering_single_trial(dev_target, z, num_classes=n_class)
+        del z, x
+        torch.cuda.empty_cache()
+    
         ### update p distribution
         for i in range(0, len(train_embedding), batch_size):
             x = torch.tensor(train_embedding[i:i+batch_size], dtype=torch.float, device=device)
@@ -773,6 +802,7 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
         del tmp_q, x
         torch.cuda.empty_cache()
         
+        ### step-wise training
         for i in range(0, len(train_embedding), batch_size):
             step += 1
             tmp_x = torch.tensor(train_embedding[i:i+batch_size], dtype=torch.float, device=device)
@@ -788,15 +818,22 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
+            
         if epoch % (args.n_epoch / 5) == 0:
             print("epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
             logging.info("IDEC train epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
-        eval_metric, delta_label = eval(model, dev_embedding, dev_n_sents, dev_target, y_pred, batch_size)
-        if epoch > 0 and delta_label > args.tol:
-            print('delta_label {:.4f}'.format(delta_label), '< tol', args.tol)
-            print('Reached tolerance threshold. Stopping training.')
+            
+        eval_metric, epoch_delta_label = eval(model, dev_embedding, dev_n_sents, dev_target, y_pred, batch_size)
+        print(epoch_delta_label)
+        if epoch_delta_label < min_delta_label:
+            min_delta_label = epoch_delta_label
             best_model = deepcopy(model).cpu()
-            break
+        else:
+            patience_count += 1
+            if patience_count == patience:
+                print('Early stopping training.')
+                break
+            
     return best_model, eval_metric
 
 def dataset_training(dataset, args):
@@ -877,7 +914,8 @@ def dataset_training(dataset, args):
 
 
 
-DATASETS=['20ng', 'reuters', 'mr', "fake_news", "corona"]
+# DATASETS=['20ng', 'reuters', 'mr', 'fake_news', 'corona']
+DATASETS=['fake_news', 'corona']
 
 def main():
 
