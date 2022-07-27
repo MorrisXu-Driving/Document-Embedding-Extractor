@@ -26,10 +26,10 @@ fake_news_path = "/raid1/p3/jiahao/Datasets/fake_news_detection"
 corona_tweets_path="/raid1/p3/jiahao/Datasets/corona_tweets/Corona_NLP"
 
 class IDEC(nn.Module):
-    def __init__(self, d_model, n_emb, n_cluster, alpha = 1):
+    def __init__(self, d_model, n_emb, max_num_seq, n_cluster, alpha = 1):
         super(IDEC, self).__init__()
         self.alpha = alpha
-        self.ae = CNNPoolingAE(d_model, n_emb)
+        self.ae = CNNPoolingAE(d_model, n_emb, max_num_seq)
         self.cluster_layer = nn.Parameter(torch.Tensor(n_cluster, n_emb), requires_grad = True)
         torch.nn.init.xavier_uniform_(self.cluster_layer.data)
     
@@ -43,10 +43,10 @@ class IDEC(nn.Module):
 
         
 class CNNPoolingAE(nn.Module):
-    def __init__(self, d_model, n_emb):
+    def __init__(self, d_model, n_emb, max_num_seq):
         super(CNNPoolingAE, self).__init__()
         self.c = d_model // 3
-        
+        self.max_num_seq = max_num_seq
         self.encoder = CNNPoolingClassifier(d_model, n_emb)
         
         self.cls = nn.Sequential(nn.Linear(n_emb, d_model),
@@ -66,16 +66,16 @@ class CNNPoolingAE(nn.Module):
     def forward(self, x, n_sents=None):
         z, _, _, _ = self.encoder(x)
         z = self.cls(z)
-        f1 = z[:, :self.c].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, 33, 1)
-        f2 = z[:, self.c:2*self.c].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, 32, 1)
-        f3 = z[:, 2*self.c:].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, 31, 1)
+        f1 = z[:, :self.c].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, self.max_num_seq + 1, 1)
+        f2 = z[:, self.c:2*self.c].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, self.max_num_seq, 1)
+        f3 = z[:, 2*self.c:].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, self.max_num_seq - 1, 1)
         
         x_prime_1 = self.tcnn1(F.relu(f1, inplace = True))
         x_prime_2 = self.tcnn2(F.relu(f2, inplace = True))
         x_prime_3 = self.tcnn3(F.relu(f3, inplace = True))
-        x_prime = x_prime_1 + x_prime_2 + x_prime_3
-        # x_prime = torch.concat([f1, f2, f3], dim = 1).mean(1)
-        x_prime = x_prime.squeeze(1) # [b, 1, n, c] -> [b, n, c]
+        # x_prime = x_prime_1 + x_prime_2 + x_prime_3
+        x_prime = torch.concat([f1, f2, f3], dim = 1).mean(1)
+        # x_prime = x_prime.squeeze(1) # [b, 1, n, c] -> [b, n, c]
         return x_prime, z
 
 
@@ -760,7 +760,8 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
                 
     
     ### pretrain AE
-    model = IDEC(d_model = 768, n_emb = 256, n_cluster = n_class).to(device)
+    max_num_seq = train_embedding.shape[-2]
+    model = IDEC(d_model = 768, n_emb = 256, max_num_seq = max_num_seq, n_cluster = n_class).to(device)
     assert isinstance(model, nn.Module)
     model.ae = pretrain(dataset, args, model.ae, train_embedding, pretrain_path = args.output_path, patience = patience)
     
@@ -834,7 +835,7 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
             epoch_loss += loss.item()
         scheduler.step()
         
-        if (epoch + 1) % 5 == 0:
+        if epoch % 5 == 0:
             print("epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
             logging.info("IDEC train epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
             
@@ -929,8 +930,7 @@ def dataset_training(dataset, args):
 
 
 
-# DATASETS=['20ng', 'reuters', 'mr', 'fake_news', 'corona']
-DATASETS=['fake_news', 'corona']
+DATASETS=['20ng', 'reuters', 'mr', 'fake_news', 'corona']
 
 def main():
 
@@ -971,7 +971,7 @@ def main():
                         help="use this for prediction")
     parser.add_argument("--do_idec", action="store_true",
                         help="use this for prediction")
-    parser.add_argument('--gamma', default=0.5, type=float, help='coefficient of clustering loss')
+    parser.add_argument('--gamma', default=0.1, type=float, help='coefficient of clustering loss')
 
     args = parser.parse_args()
     assert args.datasets in DATASETS+["all"]
