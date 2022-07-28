@@ -1,5 +1,21 @@
+import os
 import numpy as np
+import matplotlib.cm as cm
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
 from scipy.optimize import linear_sum_assignment as linear_assignment
+
+def visulizing_embeddings(embedding_bank, label_bank, dataset, fold, output_path):
+    n_classes = label_bank.max() + 1
+    colors = cm.rainbow(label_bank.astype(np.float32) / n_classes)[:, 0]
+    tsne = TSNE(n_components=2, init='pca', random_state=0)
+    transferred_embeddings = tsne.fit_transform(embedding_bank)
+    plt.scatter(transferred_embeddings[:, 0], transferred_embeddings[:, 1], c=colors)
+    if not os.path.exists(os.path.join(output_path,'visual', dataset)):
+        os.makedirs(os.path.join(output_path, 'visual', dataset), exist_ok=True)
+    plt.title(f't-SNE Visualization of Embedding Space on {dataset}')
+    plt.savefig(os.path.join(os.getcwd(), 'visual', dataset, str(fold) if fold is not None else 'embedding' + '.pdf' )
+                , dpi=400, bbox_inches='tight', pad_inches=0)
 
 class RetMetric(object):
     def __init__(self, feats, labels):
