@@ -716,6 +716,11 @@ def train_kfold_idec(dataset, args, n_class, embedding, n_sents, target):
                                                        dev_embedding, dev_n_sents, dev_target,
                                                        args.n_epoch, args.batch_size, args.lr, args.patience)
         metrics.append(eval_metric)
+        print(f"Fold {fold} Result:")
+        logging.info(f"Fold {fold} Result:")
+        for key, val in eval_metric.items():
+            print(f"{key}::{val}")
+            logging.info(f"{key}::{val}")
 
     avg_metric = {k: 0 for k in metrics[0].keys()}
     for key in avg_metric.keys():
@@ -781,10 +786,9 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
     torch.cuda.empty_cache()
     
     ### training program
-    optimizer = optim.SGD(model.parameters(), lr=lr)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size = 10, gamma=0.5)
     patience_count = 0
-    min_delta_label = 1.
     
     model.train()
     for epoch in tqdm(range(n_epoch), desc='IDEC TRAINING'):
@@ -840,9 +844,7 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
             logging.info("IDEC train epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
             
         eval_metric, epoch_delta_label = eval(model, dev_embedding, dev_n_sents, dev_target, y_pred, batch_size)
-        print(epoch_delta_label)
-        if epoch_delta_label < min_delta_label:
-            min_delta_label = epoch_delta_label
+        if epoch > 0 and epoch_delta_label > args.tol:
             best_model = deepcopy(model).cpu()
         else:
             patience_count += 1
@@ -936,23 +938,23 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path",
                         # default="bert-base-uncased",
-                        # default="nli-bert-base",
-                        default="/raid1/p3/jiahao/simsiam/runs/my-sup-simcse-bert-base-uncased"
+                        default="nli-bert-base",
+                        # default="/raid1/p3/jiahao/simsiam/runs/my-sup-simcse-bert-base-uncased"
                         # default="/raid1/p3/jiahao/simsiam/runs/bert_nli_64seqlen/checkpoints.cp"
                         )
 
     parser.add_argument("--model_type",
                         # default="plm",
-                        # default="sbert",
-                        default="simcse",
+                        default="sbert",
+                        # default="simcse",
                         # default="blendrst",
                         help="plm is origianl pretrained lm, sbert is sentence bert, simcse is Simcse, and blendrst is our method")
 
     parser.add_argument("--output_path",
-                        # default="/raid1/p3/jiahao/simsiam/runs/document_leve/bert-base-uncased-test",
-                        # default="/raid1/p3/jiahao/simsiam/runs/document_leve/sbert-nli",
-                        default="/raid1/p3/jiahao/simsiam/runs/document_level/sup-simcse-bert",
-                        # default="/raid1/p3/jiahao/simsiam/runs/document_leve/blendrst-bert-nli"
+                        # default="/raid1/p3/jiahao/simsiam/runs/document_level/bert-base-uncased",
+                        default="/raid1/p3/jiahao/simsiam/runs/document_level/sbert-nli",
+                        # default="/raid1/p3/jiahao/simsiam/runs/document_level/sup-simcse-bert",
+                        # default="/raid1/p3/jiahao/simsiam/runs/document_level/blendrst-bert-nli"
                         )
 
     parser.add_argument("--max_seq_length", type=int, default=32)
@@ -970,6 +972,8 @@ def main():
                         help="use this for prediction")
     parser.add_argument("--do_idec", action="store_true",
                         help="use this for prediction")
+    parser.add_argument("--tol", action="store_true",
+                        help="threshold for early stop of IDEC Training")
     parser.add_argument('--gamma', default=0.1, type=float, help='coefficient of clustering loss')
 
     args = parser.parse_args()
