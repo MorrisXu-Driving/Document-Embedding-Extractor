@@ -31,7 +31,7 @@ class IDEC(nn.Module):
         self.alpha = alpha
         self.ae = CNNPoolingAE(d_model, n_emb, max_num_seq)
         self.cluster_layer = nn.Parameter(torch.Tensor(n_cluster, n_emb), requires_grad = True)
-        torch.nn.init.xavier_uniform_(self.cluster_layer.data)
+        nn.init.xavier_uniform_(self.cluster_layer.data)
     
     def forward(self, x, n_sents=None):
         x_prime_1, x_prime_2, x_prime_3, z = self.ae(x)
@@ -68,9 +68,9 @@ class CNNPoolingAE(nn.Module):
         z = self.cls(z)
         
         ### inverse process of meanpooling -> concatenation
-        f1 = (z[:, :self.c] / (self.max_num_seq + 1)).unsqueeze(-1).unsqueeze(-1).repeat(1, 1, self.max_num_seq + 1, 1)
-        f2 = (z[:, self.c:2*self.c] / (self.max_num_seq)).unsqueeze(-1).unsqueeze(-1).repeat(1, 1, self.max_num_seq, 1)
-        f3 = (z[:, 2*self.c:] / (self.max_num_seq - 1)).unsqueeze(-1).unsqueeze(-1).repeat(1, 1, self.max_num_seq - 1, 1)
+        f1 = z[:, :self.c].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, self.max_num_seq + 1, 1)
+        f2 = z[:, self.c:2*self.c].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, self.max_num_seq, 1)
+        f3 = z[:, 2*self.c:].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, self.max_num_seq - 1, 1)
         
         x_prime_1 = self.tcnn1(F.relu(f1, inplace = True)).squeeze(1)
         x_prime_2 = self.tcnn2(F.relu(f2, inplace = True)).squeeze(1)
@@ -90,8 +90,8 @@ class CNNPoolingClassifier(nn.Module):
         self.cnn3 = nn.Conv2d(1, c, (4, d_model), padding=[1,0])
 
         # self.pooling = lambda x: torch.max(x, dim=-1)[0]
-        
-        self.pooling = lambda x: torch.mean(x, dim=-1)
+        # self.pooling = lambda x: torch.mean(x, dim=-1)
+        self.pooling = lambda x: torch.mean(x, dim=-1) + torch.max(x, dim=-1)[0]
         self.cls = nn.Sequential(nn.Linear(d_model, d_model),
                                  nn.ReLU(inplace=True),
                                  nn.Linear(d_model, d_model),
@@ -111,7 +111,7 @@ class CNNPoolingClassifier(nn.Module):
         f2 = self.cnn2(x)  # [b, c, n, 1]
         f3 = self.cnn3(x)  # [b, c, n, 1]
 
-        doc_embedding = F.relu(torch.cat([self.pooling(f1.squeeze(-1)), self.pooling(f2.squeeze(-1)), self.pooling(f3.squeeze(-1))], dim=1))  # [b, d_model]
+        doc_embedding = F.relu(torch.cat([self.pooling(f1.squeeze(-1)), self.pooling(f2.squeeze(-1)), self.pooling(f3.squeeze(-1))], dim=1), inplace = True)  # [b, d_model]
         output = self.cls(doc_embedding)
         return output, f1, f2, f3
 
@@ -152,7 +152,6 @@ def helper(s):
     return s
 
 def prepare_ag_news(args):
-
     logging.info("eval on AG news")
     dataset = load_dataset("ag_news")["train"]
     dataset = dataset.map(lambda examples:{"data":[helper(s) for s in examples["text"]]})
@@ -661,7 +660,7 @@ def target_distribution(q):
     return (weight.t() / weight.sum(1)).t()
 
 def pretrain(dataset, args, ae, embedding, pretrain_path='', patience = 5):
-    ae_file = pretrain_path+f"/{dataset}_noagg_mean.pt"
+    ae_file = pretrain_path+f"/{dataset}_noagg_mean_max.pt"
     if not os.path.exists(ae_file):
         pretrain_path = args.output_path
         ae = pretrain_ae(args, ae, embedding, ae_file, patience)
@@ -677,6 +676,7 @@ def pretrain_ae(args, ae, train_embedding, ae_file, patience):
     batch_size = args.batch_size
     min_loss = 1e6
     patience_count = 0
+    ae.train()
     for epoch in tqdm(range(args.n_epoch), desc='AE TRAINING'):
         epoch_loss = 0.
         step = 0
@@ -735,7 +735,9 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
                      dev_embedding, dev_n_sents, dev_target,
                      n_epoch, batch_size=1, lr=1e-3, patience=5, fold=0):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    def eval(model, dev_embedding, dev_n_sents, dev_target, y_pred_last, batch_size=1, visualize=False):
+    no_grad_batch_size = args.batch_size * 1  ### no_grad batch_size can be much larger
+    batch_size = args.batch_size
+    def eval(model, dev_embedding, dev_n_sents, dev_target, y_pred_last, no_grad_batch_size, visualize=False):
         from sklearn.metrics.cluster import normalized_mutual_info_score as nmi
         from sklearn.metrics.cluster import adjusted_rand_score as ari
         from sklearn.metrics.cluster import adjusted_mutual_info_score as ami
@@ -743,12 +745,12 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
         model.eval()
         ACC, NMI, ARI, AMI, step = 0, 0, 0, 0, 0
         with torch.no_grad():
-            for i in range(0, len(dev_embedding), args.batch_size):
+            for i in range(0, len(dev_embedding), no_grad_batch_size):
                 step += 1
-                x = torch.tensor(dev_embedding[i:i + args.batch_size], dtype = torch.float, device=device)
-                n_sents = dev_n_sents[i:i + args.batch_size].to(device)
+                x = torch.tensor(dev_embedding[i:i + no_grad_batch_size], dtype = torch.float, device=device)
+                n_sents = dev_n_sents[i:i + no_grad_batch_size].to(device)
                 _, _, _, tmp_q = model(x, n_sents)  # (b, n_class)
-                p = target_distribution(tmp_q.data)
+                p = target_distribution(tmp_q)
                 y_pred_tmp = tmp_q.cpu().detach().numpy().argmax(1)
                 if visualize:
                     _, _, _, tmp_z = model.ae(x, n_sents)
@@ -763,10 +765,10 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
                     if visualize: 
                         z = np.concatenate([z, tmp_z], axis = 0)
                     
-                ACC += cluster_acc(dev_target[i:i + args.batch_size], y_pred[i:i + args.batch_size])
-                NMI += nmi(dev_target[i:i + args.batch_size], y_pred[i:i + args.batch_size])
-                ARI += ari(dev_target[i:i + args.batch_size], y_pred[i:i + args.batch_size])
-                AMI += ami(dev_target[i:i + args.batch_size], y_pred[i:i + args.batch_size])
+                ACC += cluster_acc(dev_target[i:i + no_grad_batch_size], y_pred[i:i + no_grad_batch_size])
+                NMI += nmi(dev_target[i:i + no_grad_batch_size], y_pred[i:i + no_grad_batch_size])
+                ARI += ari(dev_target[i:i + no_grad_batch_size], y_pred[i:i + no_grad_batch_size])
+                AMI += ami(dev_target[i:i + no_grad_batch_size], y_pred[i:i + no_grad_batch_size])
                 if visualize: 
                     visulizing_embeddings(z, y_pred, dataset, fold, output_path = args.output_path)               
                 
@@ -785,8 +787,8 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
     
     ### batchified cluster paramater initialization
     with torch.no_grad():
-        for i in range(0, len(train_embedding), batch_size):
-            x = torch.tensor(train_embedding[i:i+batch_size], dtype=torch.float, device=device)
+        for i in range(0, len(train_embedding), no_grad_batch_size):
+            x = torch.tensor(train_embedding[i:i+no_grad_batch_size], dtype=torch.float, device=device)
             _, _, _, z_tmp = model.ae(x)
             z_tmp = z_tmp.cpu().detach().numpy()
             if i == 0:
@@ -799,19 +801,19 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
     torch.cuda.empty_cache()
     
     ### training program
+    model.train()
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size = 10, gamma=0.5)
     patience_count = 0
     
-    model.train()
     for epoch in tqdm(range(n_epoch), desc='IDEC TRAINING'):
         epoch_loss = 0
         step = 0
         
         ### compute y_pred_last for dev_embedding
         with torch.no_grad():
-            for i in range(0, len(dev_embedding), batch_size):
-                x = torch.tensor(dev_embedding[i:i+batch_size], dtype=torch.float, device=device)
+            for i in range(0, len(dev_embedding), no_grad_batch_size):
+                x = torch.tensor(dev_embedding[i:i+no_grad_batch_size], dtype=torch.float, device=device)
                 _, _, _, z_tmp = model.ae(x)
                 z_tmp = z_tmp.cpu().detach().numpy()
                 if i == 0:
@@ -823,26 +825,27 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
         torch.cuda.empty_cache()
     
         ### update p distribution
-        for i in range(0, len(train_embedding), batch_size):
-            x = torch.tensor(train_embedding[i:i+batch_size], dtype=torch.float, device=device)
-            _, _, _, tmp_q = model(x)
-            tmp_p = target_distribution(tmp_q.detach())
-            if i == 0:
-                p = tmp_p
-            else:
-                p = torch.concat([p, tmp_p], dim = 0)
+        with torch.no_grad():
+            for i in range(0, len(train_embedding), no_grad_batch_size):
+                x = torch.tensor(train_embedding[i:i+no_grad_batch_size], dtype=torch.float, device=device)
+                _, _, _, tmp_q = model(x)
+                tmp_p = target_distribution(tmp_q)
+                if i == 0:
+                    p = tmp_p
+                else:
+                    p = torch.concat([p, tmp_p], dim = 0)
         del tmp_q, x
         torch.cuda.empty_cache()
         
         ### step-wise training
         for i in range(0, len(train_embedding), batch_size):
             step += 1
-            tmp_x = torch.tensor(train_embedding[i:i+batch_size], dtype=torch.float, device=device)
-            n_sents = train_n_sents[i:i+batch_size].to(device)
-            target = torch.tensor(train_target[i:i+batch_size], device=device)
-            x_prime_1, x_prime_2, x_prime_3, q = model(tmp_x)
+            x = torch.tensor(train_embedding[i:i+batch_size], dtype=torch.float, device=device)
+            # n_sents = train_n_sents[i:i+batch_size].to(device)
+            # target = torch.tensor(train_target[i:i+batch_size], device=device)
+            x_prime_1, x_prime_2, x_prime_3, q = model(x)
             
-            reconstr_loss = F.mse_loss(x_prime_1, tmp_x) + F.mse_loss(x_prime_2, tmp_x) + F.mse_loss(x_prime_3, tmp_x)
+            reconstr_loss = F.mse_loss(x_prime_1, x) + F.mse_loss(x_prime_2, x) + F.mse_loss(x_prime_3, x)
             kl_loss = F.kl_div(q.log(), p[i:i+batch_size], reduction = 'batchmean')
             loss = args.gamma * kl_loss + reconstr_loss
             
@@ -856,7 +859,7 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
             print("epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
             logging.info("IDEC train epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
             
-        eval_metric, epoch_delta_label = eval(model, dev_embedding, dev_n_sents, dev_target, y_pred, batch_size)
+        eval_metric, epoch_delta_label = eval(model, dev_embedding, dev_n_sents, dev_target, y_pred, no_grad_batch_size)
         if epoch > 0 and epoch_delta_label > args.tol:
             best_model = deepcopy(model).cpu()
         else:
@@ -934,6 +937,8 @@ def dataset_training(dataset, args):
         print("idec")
         logging.info("idec")
         _,eval_metric = train_kfold_idec(dataset, args, n_class, embedding, n_sents, target)
+        print("Overall Result:")
+        logging.info("Overall Result:")
         for key, val in eval_metric.items():
             print(f"{key}::{val}")
             logging.info(f"{key}::{val}")
@@ -951,23 +956,23 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path",
                         # default="bert-base-uncased",
-                        default="nli-bert-base",
+                        # default="nli-bert-base",
                         # default="/raid1/p3/jiahao/simsiam/runs/my-sup-simcse-bert-base-uncased"
-                        # default="/raid1/p3/jiahao/simsiam/runs/bert_nli_64seqlen/checkpoints.cp"
+                        default="/raid1/p3/jiahao/simsiam/runs/bert_nli_64seqlen/checkpoints.cp"
                         )
 
     parser.add_argument("--model_type",
                         # default="plm",
-                        default="sbert",
+                        # default="sbert",
                         # default="simcse",
-                        # default="blendrst",
+                        default="blendrst",
                         help="plm is origianl pretrained lm, sbert is sentence bert, simcse is Simcse, and blendrst is our method")
 
     parser.add_argument("--output_path",
                         # default="/raid1/p3/jiahao/simsiam/runs/document_level/bert-base-uncased",
-                        default="/raid1/p3/jiahao/simsiam/runs/document_level/sbert-nli",
+                        # default="/raid1/p3/jiahao/simsiam/runs/document_level/sbert-nli",
                         # default="/raid1/p3/jiahao/simsiam/runs/document_level/sup-simcse-bert",
-                        # default="/raid1/p3/jiahao/simsiam/runs/document_level/blendrst-bert-nli"
+                        default="/raid1/p3/jiahao/simsiam/runs/document_level/blendrst-bert-nli"
                         )
 
     parser.add_argument("--max_seq_length", type=int, default=32)
