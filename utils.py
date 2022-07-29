@@ -13,7 +13,6 @@ def visulizing_embeddings(embedding_bank, label_bank, dataset, fold, output_path
     plt.scatter(transferred_embeddings[:, 0], transferred_embeddings[:, 1], c=colors)
     if not os.path.exists(os.path.join(output_path,'visual', dataset)):
         os.makedirs(os.path.join(output_path, 'visual', dataset), exist_ok=True)
-    plt.title(f't-SNE Visualization of Embedding Space on {dataset}')
     plt.savefig(os.path.join(os.getcwd(), 'visual', dataset, str(fold) if fold is not None else 'embedding' + '.pdf' )
                 , dpi=400, bbox_inches='tight', pad_inches=0)
 

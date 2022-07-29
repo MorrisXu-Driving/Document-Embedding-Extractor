@@ -34,12 +34,12 @@ class IDEC(nn.Module):
         nn.init.xavier_uniform_(self.cluster_layer.data)
     
     def forward(self, x, n_sents=None):
-        x_prime_1, x_prime_2, x_prime_3, z = self.ae(x)
+        x_prime, z = self.ae(x)
         q = 1.0 / (1.0 + torch.sum(
             torch.pow(z.unsqueeze(1) - self.cluster_layer, 2), 2) / self.alpha)
         q = q.pow((self.alpha + 1.0) / 2.0)
         q = (q.t() / torch.sum(q, 1)).t()
-        return x_prime_1, x_prime_2, x_prime_3, q
+        return x_prime, q
 
         
 class CNNPoolingAE(nn.Module):
@@ -65,20 +65,20 @@ class CNNPoolingAE(nn.Module):
 
     def forward(self, x, n_sents=None):
         z, _, _, _ = self.encoder(x)
-        z = self.cls(z)
+        doc_embedding = self.cls(z)
         
         ### inverse process of meanpooling -> concatenation
-        f1 = z[:, :self.c].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, self.max_num_seq + 1, 1)
-        f2 = z[:, self.c:2*self.c].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, self.max_num_seq, 1)
-        f3 = z[:, 2*self.c:].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, self.max_num_seq - 1, 1)
+        f1 = doc_embedding[:, :self.c].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, self.max_num_seq + 1, 1)
+        f2 = doc_embedding[:, self.c:2*self.c].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, self.max_num_seq, 1)
+        f3 = doc_embedding[:, 2*self.c:].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, self.max_num_seq - 1, 1)
         
-        x_prime_1 = self.tcnn1(F.relu(f1, inplace = True)).squeeze(1)
-        x_prime_2 = self.tcnn2(F.relu(f2, inplace = True)).squeeze(1)
-        x_prime_3 = self.tcnn3(F.relu(f3, inplace = True)).squeeze(1)
+        x_prime_1 = self.tcnn1(F.relu(f1, inplace = True))
+        x_prime_2 = self.tcnn2(F.relu(f2, inplace = True))
+        x_prime_3 = self.tcnn3(F.relu(f3, inplace = True))
         # x_prime = x_prime_1 + x_prime_2 + x_prime_3
-        # x_prime = torch.concat([x_prime_1, x_prime_2, x_prime_3], dim = 1).mean(1)
+        x_prime = torch.concat([x_prime_1, x_prime_2, x_prime_3], dim = 1).mean(1)
         # x_prime = x_prime.squeeze(1) # [b, 1, n, c] -> [b, n, c]
-        return x_prime_1, x_prime_2, x_prime_3, z
+        return x_prime, z
 
 
 class CNNPoolingClassifier(nn.Module):
@@ -660,7 +660,7 @@ def target_distribution(q):
     return (weight.t() / weight.sum(1)).t()
 
 def pretrain(dataset, args, ae, embedding, pretrain_path='', patience = 5):
-    ae_file = pretrain_path+f"/{dataset}_noagg_mean_max.pt"
+    ae_file = pretrain_path+f"/{dataset}_agg_mean_max.pt"
     if not os.path.exists(ae_file):
         pretrain_path = args.output_path
         ae = pretrain_ae(args, ae, embedding, ae_file, patience)
@@ -683,8 +683,8 @@ def pretrain_ae(args, ae, train_embedding, ae_file, patience):
         for i in range(0, len(train_embedding), batch_size):
             step += 1
             x = torch.tensor(train_embedding[i:i + batch_size], dtype=torch.float, device=device)
-            x_prime_1, x_prime_2, x_prime_3, _ = ae(x)
-            loss = F.mse_loss(x_prime_1, x) + F.mse_loss(x_prime_2, x) + F.mse_loss(x_prime_3, x)  # [b, n, c]
+            x_prime, _ = ae(x)
+            loss = F.mse_loss(x_prime, x)
             
             loss.backward()
             optimizer.step()
@@ -749,7 +749,7 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
                 step += 1
                 x = torch.tensor(dev_embedding[i:i + no_grad_batch_size], dtype = torch.float, device=device)
                 n_sents = dev_n_sents[i:i + no_grad_batch_size].to(device)
-                _, _, _, tmp_q = model(x, n_sents)  # (b, n_class)
+                _, tmp_q = model(x, n_sents)  # (b, n_class)
                 p = target_distribution(tmp_q)
                 y_pred_tmp = tmp_q.cpu().detach().numpy().argmax(1)
                 if visualize:
@@ -789,7 +789,7 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
     with torch.no_grad():
         for i in range(0, len(train_embedding), no_grad_batch_size):
             x = torch.tensor(train_embedding[i:i+no_grad_batch_size], dtype=torch.float, device=device)
-            _, _, _, z_tmp = model.ae(x)
+            _, z_tmp = model.ae(x)
             z_tmp = z_tmp.cpu().detach().numpy()
             if i == 0:
                 z = z_tmp
@@ -814,7 +814,7 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
         with torch.no_grad():
             for i in range(0, len(dev_embedding), no_grad_batch_size):
                 x = torch.tensor(dev_embedding[i:i+no_grad_batch_size], dtype=torch.float, device=device)
-                _, _, _, z_tmp = model.ae(x)
+                _, z_tmp = model.ae(x)
                 z_tmp = z_tmp.cpu().detach().numpy()
                 if i == 0:
                     z = z_tmp
@@ -828,7 +828,7 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
         with torch.no_grad():
             for i in range(0, len(train_embedding), no_grad_batch_size):
                 x = torch.tensor(train_embedding[i:i+no_grad_batch_size], dtype=torch.float, device=device)
-                _, _, _, tmp_q = model(x)
+                _, tmp_q = model(x)
                 tmp_p = target_distribution(tmp_q)
                 if i == 0:
                     p = tmp_p
@@ -843,9 +843,9 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
             x = torch.tensor(train_embedding[i:i+batch_size], dtype=torch.float, device=device)
             # n_sents = train_n_sents[i:i+batch_size].to(device)
             # target = torch.tensor(train_target[i:i+batch_size], device=device)
-            x_prime_1, x_prime_2, x_prime_3, q = model(x)
+            x_prime, q = model(x)
             
-            reconstr_loss = F.mse_loss(x_prime_1, x) + F.mse_loss(x_prime_2, x) + F.mse_loss(x_prime_3, x)
+            reconstr_loss = F.mse_loss(x_prime, x)
             kl_loss = F.kl_div(q.log(), p[i:i+batch_size], reduction = 'batchmean')
             loss = args.gamma * kl_loss + reconstr_loss
             
