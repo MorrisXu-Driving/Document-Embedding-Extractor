@@ -89,9 +89,9 @@ class CNNPoolingClassifier(nn.Module):
         self.cnn2 = nn.Conv2d(1, c, (3, d_model), padding=[1,0])
         self.cnn3 = nn.Conv2d(1, c, (4, d_model), padding=[1,0])
 
-        # self.pooling = lambda x: torch.max(x, dim=-1)[0]
+        self.pooling = lambda x: torch.max(x, dim=-1)[0]
         # self.pooling = lambda x: torch.mean(x, dim=-1)
-        self.pooling = lambda x: torch.mean(x, dim=-1) + torch.max(x, dim=-1)[0]
+        # self.pooling = lambda x: torch.mean(x, dim=-1) + torch.max(x, dim=-1)[0]
         self.cls = nn.Sequential(nn.Linear(d_model, d_model),
                                  nn.ReLU(inplace=True),
                                  nn.Linear(d_model, d_model),
@@ -366,7 +366,7 @@ def get_sent_embedding(docs, args):
                         sent_embeddings = ((model(**batch).last_hidden_state)*(batch["attention_mask"].unsqueeze(-1))).sum(dim=1)/batch["attention_mask"].sum(dim=-1, keepdim=True)
                 else:
                     sent_embeddings = model(batch["input_ids"], batch["attention_mask"].sum(dim=-1))
-                sent_embeddings = sent_embeddings.cpu().detach().numpy()
+                sent_embeddings = sent_embeddings.cpu().numpy()
             embedding_bank.extend(sent_embeddings)
         return embedding_bank
 
@@ -496,7 +496,7 @@ class Confusion(object):
 
     def optimal_assignment(self, gt_n_cluster=None, assign=None):
         if assign is None:
-            mat = -self.conf.cpu().detach().numpy()  # hungaian finds the minimum cost
+            mat = -self.conf.cpu().numpy()  # hungaian finds the minimum cost
             r, assign = hungarian(mat)
         self.conf = self.conf[:, assign]
         self.gt_n_cluster = gt_n_cluster
@@ -548,7 +548,7 @@ def clustering_single_trial(y_true, embeddings=None, num_classes=10, random_stat
     """"Evaluate the embeddings using KMeans"""
     kmeans = cluster.KMeans(n_clusters=num_classes, random_state=random_state)
     if isinstance(embeddings, torch.Tensor):
-        kmeans.fit(embeddings.cpu().detach().numpy())
+        kmeans.fit(embeddings.cpu().numpy())
     else:
         kmeans.fit(embeddings)
     
@@ -660,7 +660,7 @@ def target_distribution(q):
     return (weight.t() / weight.sum(1)).t()
 
 def pretrain(dataset, args, ae, embedding, pretrain_path='', patience = 5):
-    ae_file = pretrain_path+f"/{dataset}_agg_mean_max.pt"
+    ae_file = pretrain_path+f"/{dataset}_agg_max_256_ae.pt"
     if not os.path.exists(ae_file):
         pretrain_path = args.output_path
         ae = pretrain_ae(args, ae, embedding, ae_file, patience)
@@ -712,6 +712,8 @@ def pretrain_ae(args, ae, train_embedding, ae_file, patience):
 def train_kfold_idec(dataset, args, n_class, embedding, n_sents, target):
     kf = KFold(args.n_fold)
     metrics = []
+    fold_acc = 0.0
+    idec_file = args.output_path+f"/{dataset}_agg_max_256_idec.pt"
     for fold, (train_index, dev_index) in enumerate(kf.split(embedding)):
         train_embedding, train_n_sents, train_target = embedding[train_index], n_sents[train_index], target[train_index]
         dev_embedding, dev_n_sents, dev_target = embedding[dev_index], n_sents[dev_index], target[dev_index]
@@ -724,7 +726,11 @@ def train_kfold_idec(dataset, args, n_class, embedding, n_sents, target):
         for key, val in eval_metric.items():
             print(f"{key}::{val}")
             logging.info(f"{key}::{val}")
-
+        if eval_metric['ACC'] > fold_acc:
+            fold_acc = eval_metric['ACC']
+            torch.save(cnn_idec.state_dict(), idec_file)
+            print(f'Higher ACC achieved, IDEC params saved to {idec_file}')
+    
     avg_metric = {k: 0 for k in metrics[0].keys()}
     for key in avg_metric.keys():
         avg_metric[key] = sum([metrics[i][key] for i in range(len(metrics))]) / args.n_fold
@@ -751,10 +757,10 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
                 n_sents = dev_n_sents[i:i + no_grad_batch_size].to(device)
                 _, tmp_q = model(x, n_sents)  # (b, n_class)
                 p = target_distribution(tmp_q)
-                y_pred_tmp = tmp_q.cpu().detach().numpy().argmax(1)
+                y_pred_tmp = tmp_q.cpu().numpy().argmax(1)
                 if visualize:
                     _, _, _, tmp_z = model.ae(x, n_sents)
-                    tmp_z = tmp_z.cpu().detach().numpy()
+                    tmp_z = tmp_z.cpu().numpy()
                 
                 if i == 0:
                     y_pred = y_pred_tmp
@@ -790,7 +796,7 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
         for i in range(0, len(train_embedding), no_grad_batch_size):
             x = torch.tensor(train_embedding[i:i+no_grad_batch_size], dtype=torch.float, device=device)
             _, z_tmp = model.ae(x)
-            z_tmp = z_tmp.cpu().detach().numpy()
+            z_tmp = z_tmp.cpu().numpy()
             if i == 0:
                 z = z_tmp
             else:
@@ -815,7 +821,7 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
             for i in range(0, len(dev_embedding), no_grad_batch_size):
                 x = torch.tensor(dev_embedding[i:i+no_grad_batch_size], dtype=torch.float, device=device)
                 _, z_tmp = model.ae(x)
-                z_tmp = z_tmp.cpu().detach().numpy()
+                z_tmp = z_tmp.cpu().numpy()
                 if i == 0:
                     z = z_tmp
                 else:
@@ -947,38 +953,36 @@ def dataset_training(dataset, args):
     print("done")
 
 
-
-
-
 DATASETS=['20ng', 'reuters', 'mr', 'fake_news', 'corona']
+# DATASETS=['reuters', 'mr', 'fake_news', 'corona']
 def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path",
-                        # default="bert-base-uncased",
+                        default="bert-base-uncased",
                         # default="nli-bert-base",
                         # default="/raid1/p3/jiahao/simsiam/runs/my-sup-simcse-bert-base-uncased"
-                        default="/raid1/p3/jiahao/simsiam/runs/bert_nli_64seqlen/checkpoints.cp"
+                        # default="/raid1/p3/jiahao/simsiam/runs/bert_nli_64seqlen/checkpoints.cp"
                         )
 
     parser.add_argument("--model_type",
-                        # default="plm",
+                        default="plm",
                         # default="sbert",
                         # default="simcse",
-                        default="blendrst",
+                        # default="blendrst",
                         help="plm is origianl pretrained lm, sbert is sentence bert, simcse is Simcse, and blendrst is our method")
 
     parser.add_argument("--output_path",
-                        # default="/raid1/p3/jiahao/simsiam/runs/document_level/bert-base-uncased",
+                        default="/raid1/p3/jiahao/simsiam/runs/document_level/bert-base-uncased",
                         # default="/raid1/p3/jiahao/simsiam/runs/document_level/sbert-nli",
                         # default="/raid1/p3/jiahao/simsiam/runs/document_level/sup-simcse-bert",
-                        default="/raid1/p3/jiahao/simsiam/runs/document_level/blendrst-bert-nli"
+                        # default="/raid1/p3/jiahao/simsiam/runs/document_level/blendrst-bert-nli"
                         )
 
     parser.add_argument("--max_seq_length", type=int, default=32)
 
     parser.add_argument("--is_debug", action="store_true")
-    parser.add_argument("--n_fold", type=int, default=5)
+    parser.add_argument("--n_fold", type=int, default=3)
     parser.add_argument("--n_epoch", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
