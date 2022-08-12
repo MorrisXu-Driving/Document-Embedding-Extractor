@@ -5,6 +5,10 @@ import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 from scipy.optimize import linear_sum_assignment as linear_assignment
 
+def get_lr(optimizer):
+    for p in optimizer.param_groups:
+        return p["lr"]
+
 def visulizing_embeddings(embedding_bank, label_bank, dataset, fold, output_path):
     n_classes = label_bank.max() + 1
     colors = cm.rainbow(label_bank.astype(np.float32) / n_classes)[:, 0]

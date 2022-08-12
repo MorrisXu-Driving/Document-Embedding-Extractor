@@ -9,7 +9,8 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import transformers
-from utils import RetMetric, cluster_acc, visulizing_embeddings
+from warmup_scheduler_pytorch.warmup_module import WarmUpScheduler
+from utils import RetMetric, cluster_acc, visulizing_embeddings, get_lr
 from nltk.tokenize import sent_tokenize
 from sklearn.datasets import fetch_20newsgroups
 from sklearn.metrics import precision_recall_fscore_support
@@ -40,21 +41,22 @@ class IDEC(nn.Module):
         q = q.pow((self.alpha + 1.0) / 2.0)
         q = (q.t() / torch.sum(q, 1)).t()
         return x_prime, q
-
-        
+    
+    
+    
 class CNNPoolingAE(nn.Module):
     def __init__(self, d_model, n_emb, max_num_seq):
         super(CNNPoolingAE, self).__init__()
         self.c = d_model // 3
         self.max_num_seq = max_num_seq
         self.encoder = CNNPoolingClassifier(d_model, n_emb)
-        
+
         self.cls = nn.Sequential(nn.Linear(n_emb, d_model),
                                  nn.ReLU(inplace=True),
                                  nn.Linear(d_model, d_model),
                                  nn.ReLU(inplace=True),
                                  nn.Linear(d_model, d_model))
-        
+
         self.tcnn1 = nn.ConvTranspose2d(self.c, 1, (2, d_model), padding=[1,0])
         self.tcnn2 = nn.ConvTranspose2d(self.c, 1, (3, d_model), padding=[1,0])
         self.tcnn3 = nn.ConvTranspose2d(self.c, 1, (4, d_model), padding=[1,0])
@@ -66,12 +68,12 @@ class CNNPoolingAE(nn.Module):
     def forward(self, x, n_sents=None):
         z, _, _, _ = self.encoder(x)
         doc_embedding = self.cls(z)
-        
+
         ### inverse process of meanpooling -> concatenation
         f1 = doc_embedding[:, :self.c].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, self.max_num_seq + 1, 1)
         f2 = doc_embedding[:, self.c:2*self.c].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, self.max_num_seq, 1)
         f3 = doc_embedding[:, 2*self.c:].unsqueeze(-1).unsqueeze(-1).repeat(1, 1, self.max_num_seq - 1, 1)
-        
+
         x_prime_1 = self.tcnn1(F.relu(f1, inplace = True))
         x_prime_2 = self.tcnn2(F.relu(f2, inplace = True))
         x_prime_3 = self.tcnn3(F.relu(f3, inplace = True))
@@ -79,6 +81,31 @@ class CNNPoolingAE(nn.Module):
         x_prime = torch.concat([x_prime_1, x_prime_2, x_prime_3], dim = 1).mean(1)
         # x_prime = x_prime.squeeze(1) # [b, 1, n, c] -> [b, n, c]
         return x_prime, z
+
+
+        
+# class CNNPoolingAE(nn.Module):
+#     def __init__(self, d_model, n_emb, max_num_seq):
+#         super(CNNPoolingAE, self).__init__()
+#         self.c = d_model // 3
+#         self.max_num_seq = max_num_seq
+#         self.encoder = CNNPoolingClassifier(d_model, n_emb)
+        
+#         self.cls = nn.Sequential(nn.ReLU(inplace=True),
+#                                  nn.Linear(n_emb, d_model),
+#                                  nn.ReLU(inplace=True),
+#                                  nn.Linear(d_model, d_model),
+#                                  nn.ReLU(inplace=True),
+#                                  nn.Linear(d_model, d_model))
+
+#         for p in self.parameters():
+#             if p.dim() > 1:
+#                 nn.init.xavier_uniform_(p)
+
+#     def forward(self, x, n_sents=None):
+#         z, _, _, _ = self.encoder(x)
+#         x_prime = self.cls(z)
+#         return x_prime, z
 
 
 class CNNPoolingClassifier(nn.Module):
@@ -90,8 +117,6 @@ class CNNPoolingClassifier(nn.Module):
         self.cnn3 = nn.Conv2d(1, c, (4, d_model), padding=[1,0])
 
         self.pooling = lambda x: torch.max(x, dim=-1)[0]
-        # self.pooling = lambda x: torch.mean(x, dim=-1)
-        # self.pooling = lambda x: torch.mean(x, dim=-1) + torch.max(x, dim=-1)[0]
         self.cls = nn.Sequential(nn.Linear(d_model, d_model),
                                  nn.ReLU(inplace=True),
                                  nn.Linear(d_model, d_model),
@@ -660,7 +685,7 @@ def target_distribution(q):
     return (weight.t() / weight.sum(1)).t()
 
 def pretrain(dataset, args, ae, embedding, pretrain_path='', patience = 5):
-    ae_file = pretrain_path+f"/{dataset}_agg_max_256_ae.pt"
+    ae_file = pretrain_path+f"/{dataset}_agg_max_32_ae.pt"
     if not os.path.exists(ae_file):
         pretrain_path = args.output_path
         ae = pretrain_ae(args, ae, embedding, ae_file, patience)
@@ -691,10 +716,10 @@ def pretrain_ae(args, ae, train_embedding, ae_file, patience):
             optimizer.zero_grad()
             epoch_loss += loss.item()
         scheduler.step()
-            
+
         if (epoch + 1) % 5 == 0:
-            print("AE pretrain epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
-            logging.info("AE pretrain epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
+            print("AE pretrain epoch {} loss = {:.4f} lr = {:.10f}".format(epoch, epoch_loss / step, get_lr(optimizer)))
+            logging.info("AE pretrain epoch {} loss = {:.4f} lr = {:.10f}".format(epoch, epoch_loss / step, get_lr(optimizer)))
         if epoch_loss < min_loss:
             min_loss = epoch_loss
             best_model = deepcopy(ae.state_dict())
@@ -713,7 +738,7 @@ def train_kfold_idec(dataset, args, n_class, embedding, n_sents, target):
     kf = KFold(args.n_fold)
     metrics = []
     fold_acc = 0.0
-    idec_file = args.output_path+f"/{dataset}_agg_max_256_idec.pt"
+    idec_file = args.output_path+f"/{dataset}_agg_max_32_idec.pt"
     for fold, (train_index, dev_index) in enumerate(kf.split(embedding)):
         train_embedding, train_n_sents, train_target = embedding[train_index], n_sents[train_index], target[train_index]
         dev_embedding, dev_n_sents, dev_target = embedding[dev_index], n_sents[dev_index], target[dev_index]
@@ -787,7 +812,7 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
     
     ### pretrain AE
     max_num_seq = train_embedding.shape[-2]
-    model = IDEC(d_model = 768, n_emb = 256, max_num_seq = max_num_seq, n_cluster = n_class).to(device)
+    model = IDEC(d_model = 768, n_emb = 32, max_num_seq = max_num_seq, n_cluster = n_class).to(device)
     assert isinstance(model, nn.Module)
     model.ae = pretrain(dataset, args, model.ae, train_embedding, pretrain_path = args.output_path, patience = patience)
     
@@ -808,9 +833,16 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
     
     ### training program
     model.train()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size = 10, gamma=0.5)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size = 20, gamma=0.5)
+    # warmup_scheduler = WarmUpScheduler(optimizer, scheduler,
+    #                                len_loader= len(train_embedding) // batch_size,
+    #                                warmup_steps=len(train_embedding) // batch_size // 2,
+    #                                warmup_start_lr=0.1/100,
+    #                                warmup_mode='linear',
+    #                                verbose = False)
     patience_count = 0
+    min_loss = 1e6
     
     for epoch in tqdm(range(n_epoch), desc='IDEC TRAINING'):
         epoch_loss = 0
@@ -847,32 +879,35 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
         for i in range(0, len(train_embedding), batch_size):
             step += 1
             x = torch.tensor(train_embedding[i:i+batch_size], dtype=torch.float, device=device)
-            # n_sents = train_n_sents[i:i+batch_size].to(device)
-            # target = torch.tensor(train_target[i:i+batch_size], device=device)
             x_prime, q = model(x)
             
             reconstr_loss = F.mse_loss(x_prime, x)
             kl_loss = F.kl_div(q.log(), p[i:i+batch_size], reduction = 'batchmean')
-            loss = args.gamma * kl_loss + reconstr_loss
+            loss = args.gamma * kl_loss + 0.5 * reconstr_loss
             
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
+            # warmup_scheduler.step()
         scheduler.step()
         
+        epoch_loss /= step
         if epoch % 5 == 0:
-            print("epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
-            logging.info("IDEC train epoch {} loss = {:.4f}".format(epoch, epoch_loss / step))
+            print("epoch {} loss = {:.4f} lr = {:.10f}".format(epoch, epoch_loss, get_lr(optimizer)))
+            logging.info("IDEC train epoch {} loss = {:.4f} lr = {:.10f}".format(epoch, epoch_loss, get_lr(optimizer)))
             
-        eval_metric, epoch_delta_label = eval(model, dev_embedding, dev_n_sents, dev_target, y_pred, no_grad_batch_size)
-        if epoch > 0 and epoch_delta_label > args.tol:
+        eval_metric, _ = eval(model, dev_embedding, dev_n_sents, dev_target, y_pred, no_grad_batch_size)
+        if epoch_loss < min_loss:
+            if epoch >= 5:
+                min_loss = epoch_loss
             best_model = deepcopy(model).cpu()
         else:
             patience_count += 1
             if patience_count == patience:
-                print('Early stopping training.')
+                print('early stopping')
                 break
+
         
     return best_model, eval_metric
 
@@ -959,24 +994,24 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path",
-                        default="bert-base-uncased",
+                        # default="bert-base-uncased",
                         # default="nli-bert-base",
                         # default="/raid1/p3/jiahao/simsiam/runs/my-sup-simcse-bert-base-uncased"
-                        # default="/raid1/p3/jiahao/simsiam/runs/bert_nli_64seqlen/checkpoints.cp"
+                        default="/raid1/p3/jiahao/simsiam/runs/bert_nli_64seqlen/checkpoints.cp"
                         )
 
     parser.add_argument("--model_type",
-                        default="plm",
+                        # default="plm",
                         # default="sbert",
                         # default="simcse",
-                        # default="blendrst",
+                        default="blendrst",
                         help="plm is origianl pretrained lm, sbert is sentence bert, simcse is Simcse, and blendrst is our method")
 
     parser.add_argument("--output_path",
-                        default="/raid1/p3/jiahao/simsiam/runs/document_level/bert-base-uncased",
+                        # default="/raid1/p3/jiahao/simsiam/runs/document_level/bert-base-uncased",
                         # default="/raid1/p3/jiahao/simsiam/runs/document_level/sbert-nli",
                         # default="/raid1/p3/jiahao/simsiam/runs/document_level/sup-simcse-bert",
-                        # default="/raid1/p3/jiahao/simsiam/runs/document_level/blendrst-bert-nli"
+                        default="/raid1/p3/jiahao/simsiam/runs/document_level/blendrst-bert-nli"
                         )
 
     parser.add_argument("--max_seq_length", type=int, default=32)
@@ -996,7 +1031,7 @@ def main():
                         help="use this for prediction")
     parser.add_argument("--tol", action="store_true",
                         help="threshold for early stop of IDEC Training")
-    parser.add_argument('--gamma', default=0.1, type=float, help='coefficient of clustering loss')
+    parser.add_argument('--gamma', default=1.0, type=float, help='coefficient of clustering loss')
 
     args = parser.parse_args()
     assert args.datasets in DATASETS+["all"]
