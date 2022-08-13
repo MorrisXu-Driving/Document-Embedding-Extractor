@@ -684,6 +684,7 @@ def target_distribution(q):
     weight = q**2 / q.sum(0)
     return (weight.t() / weight.sum(1)).t()
 
+
 def pretrain(dataset, args, ae, embedding, pretrain_path='', patience = 5):
     ae_file = pretrain_path+f"/{dataset}_agg_max_32_ae.pt"
     if not os.path.exists(ae_file):
@@ -693,6 +694,15 @@ def pretrain(dataset, args, ae, embedding, pretrain_path='', patience = 5):
         ae.load_state_dict(torch.load(ae_file))
         print(f'load pretrained AE from {ae_file}')
     return ae
+
+def mse(input, target, zeros_mask):
+    loss = (input-target)**2
+    loss = torch.where(zeros_mask, torch.tensor(0, dtype=torch.float, device="cuda"), loss)
+    return loss.mean()
+
+def modify_grad(grad_mat, zeros_mask):
+    grad_mat = torch.where(zeros_mask, torch.tensor(0, dtype=torch.float, device="cuda"), grad_mat)
+    return grad_mat
         
 def pretrain_ae(args, ae, train_embedding, ae_file, patience):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -709,8 +719,12 @@ def pretrain_ae(args, ae, train_embedding, ae_file, patience):
             step += 1
             x = torch.tensor(train_embedding[i:i + batch_size], dtype=torch.float, device=device)
             x_prime, _ = ae(x)
-            loss = F.mse_loss(x_prime, x)
             
+            ### set the grad of elements == 0 to 0
+            zeros_mask = (x == 0).type(torch.cuda.BoolTensor)
+            x_prime.register_hook(lambda grad_mat: modify_grad(grad_mat, zeros_mask))
+            
+            loss = mse(x_prime, x, zeros_mask)
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
@@ -718,8 +732,8 @@ def pretrain_ae(args, ae, train_embedding, ae_file, patience):
         scheduler.step()
 
         if (epoch + 1) % 5 == 0:
-            print("AE pretrain epoch {} loss = {:.4f} lr = {:.10f}".format(epoch, epoch_loss / step, get_lr(optimizer)))
-            logging.info("AE pretrain epoch {} loss = {:.4f} lr = {:.10f}".format(epoch, epoch_loss / step, get_lr(optimizer)))
+            print("AE pretrain epoch {} loss = {:.10f} lr = {:.10f}".format(epoch, epoch_loss / step, get_lr(optimizer)))
+            logging.info("AE pretrain epoch {} loss = {:.10f} lr = {:.10f}".format(epoch, epoch_loss / step, get_lr(optimizer)))
         if epoch_loss < min_loss:
             min_loss = epoch_loss
             best_model = deepcopy(ae.state_dict())
@@ -737,7 +751,7 @@ def pretrain_ae(args, ae, train_embedding, ae_file, patience):
 def train_kfold_idec(dataset, args, n_class, embedding, n_sents, target):
     kf = KFold(args.n_fold)
     metrics = []
-    fold_acc = 0.0
+    fold_acc = 100.
     idec_file = args.output_path+f"/{dataset}_agg_max_32_idec.pt"
     for fold, (train_index, dev_index) in enumerate(kf.split(embedding)):
         train_embedding, train_n_sents, train_target = embedding[train_index], n_sents[train_index], target[train_index]
@@ -751,7 +765,7 @@ def train_kfold_idec(dataset, args, n_class, embedding, n_sents, target):
         for key, val in eval_metric.items():
             print(f"{key}::{val}")
             logging.info(f"{key}::{val}")
-        if eval_metric['ACC'] > fold_acc:
+        if eval_metric['ACC'] < fold_acc:
             fold_acc = eval_metric['ACC']
             torch.save(cnn_idec.state_dict(), idec_file)
             print(f'Higher ACC achieved, IDEC params saved to {idec_file}')
@@ -881,7 +895,11 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
             x = torch.tensor(train_embedding[i:i+batch_size], dtype=torch.float, device=device)
             x_prime, q = model(x)
             
-            reconstr_loss = F.mse_loss(x_prime, x)
+            ### set the grad of elements == 0 to 0
+            zeros_mask = (x == 0).type(torch.cuda.BoolTensor)
+            x_prime.register_hook(lambda grad_mat: modify_grad(grad_mat, zeros_mask))
+            
+            reconstr_loss = mse(x_prime, x, zeros_mask)
             kl_loss = F.kl_div(q.log(), p[i:i+batch_size], reduction = 'batchmean')
             loss = args.gamma * kl_loss + 0.5 * reconstr_loss
             
@@ -899,7 +917,7 @@ def train_idec(dataset, args, n_class, train_embedding, train_n_sents, train_tar
             
         eval_metric, _ = eval(model, dev_embedding, dev_n_sents, dev_target, y_pred, no_grad_batch_size)
         if epoch_loss < min_loss:
-            if epoch >= 5:
+            if epoch >= 10:
                 min_loss = epoch_loss
             best_model = deepcopy(model).cpu()
         else:
@@ -996,22 +1014,22 @@ def main():
     parser.add_argument("--model_name_or_path",
                         # default="bert-base-uncased",
                         # default="nli-bert-base",
-                        # default="/raid1/p3/jiahao/simsiam/runs/my-sup-simcse-bert-base-uncased"
-                        default="/raid1/p3/jiahao/simsiam/runs/bert_nli_64seqlen/checkpoints.cp"
+                        default="/raid1/p3/jiahao/simsiam/runs/my-sup-simcse-bert-base-uncased"
+                        # default="/raid1/p3/jiahao/simsiam/runs/bert_nli_64seqlen/checkpoints.cp"
                         )
 
     parser.add_argument("--model_type",
                         # default="plm",
                         # default="sbert",
-                        # default="simcse",
-                        default="blendrst",
+                        default="simcse",
+                        # default="blendrst",
                         help="plm is origianl pretrained lm, sbert is sentence bert, simcse is Simcse, and blendrst is our method")
 
     parser.add_argument("--output_path",
                         # default="/raid1/p3/jiahao/simsiam/runs/document_level/bert-base-uncased",
                         # default="/raid1/p3/jiahao/simsiam/runs/document_level/sbert-nli",
-                        # default="/raid1/p3/jiahao/simsiam/runs/document_level/sup-simcse-bert",
-                        default="/raid1/p3/jiahao/simsiam/runs/document_level/blendrst-bert-nli"
+                        default="/raid1/p3/jiahao/simsiam/runs/document_level/sup-simcse-bert",
+                        # default="/raid1/p3/jiahao/simsiam/runs/document_level/blendrst-bert-nli"
                         )
 
     parser.add_argument("--max_seq_length", type=int, default=32)
@@ -1021,7 +1039,7 @@ def main():
     parser.add_argument("--n_epoch", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--datasets", default="all", type=str)
     parser.add_argument("--do_clustering", action="store_true",
                         help="use this to run clustering")
