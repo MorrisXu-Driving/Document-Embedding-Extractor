@@ -1,5 +1,6 @@
 # Document-Embedding-Extractor (Updating)
 A CNN-based pooling layer to project a document matrix into a document embedding for fast and efficient retrieval and recommendation based on pre-trained Sentence BERT.
+Code for Dissertation: [Deep metric based feature engineering to Improve document-level representation for document clustering](https://scholar.google.com.sg/citations?view_op=view_citation&hl=en&user=vGeK7DUAAAAJ&citation_for_view=vGeK7DUAAAAJ:u-x6o8ySG0sC)
 
 # Prerequisites
 * Python 3.6 or above
@@ -59,3 +60,5 @@ If the model converges smoothly, you can see the embeddings are well clustered a
 - [Convolutional Neural Networks for Sentence Classification](https://arxiv.org/pdf/1408.5882.pdf)
 - [Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks](https://arxiv.org/abs/1908.10084)
 - [Multi-Similarity Loss with General Pair Weighting for Deep Metric Learning](https://arxiv.org/abs/1904.06627)
+
+
